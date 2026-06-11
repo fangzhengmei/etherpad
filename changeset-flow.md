@@ -503,14 +503,16 @@ thisSession.rev = newRev;
 // 第 985 行：如果 newRev 推进了，更新时间戳
 if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
 
-// ★ 第 986 行：广播给所有客户端（包括提交者！）
+// ★ 第 986 行：调用 updatePadClients() 遍历 pad 房间内所有 socket
+// （注意：房间内包括提交者自己的 socket，但不意味着一定会收到 NEW_CHANGES，
+//  取决于 sessioninfo.rev < pad.head 的条件）
 await exports.updatePadClients(pad);
 ```
 
 **关键发现**：服务端的执行顺序是：
 1. 先 `socket.emit(ACCEPT_COMMIT)` 给提交者
 2. 再更新 `thisSession.rev = newRev`（由于 thisSession 是 sessioninfos[socket.id] 的引用，sessioninfos 中对应项同步更新）
-3. 最后才调用 `updatePadClients()` 广播给所有客户端（包括提交者自己的 socket）
+3. 最后才调用 `updatePadClients()` 遍历 pad 房间内所有 socket（包括提交者自己的 socket，但只有满足 `sessioninfo.rev < pad.head` 条件时才会实际发送 NEW_CHANGES）
 
 所以提交者会不会再收到 `NEW_CHANGES`，取决于调用 `updatePadClients()` 时，提交者的 `sessioninfo.rev` 与 `pad.head` 的关系——而此时提交者的 `sessioninfo.rev` 已经在第 2 步被更新为 `newRev` 了。
 
@@ -674,18 +676,22 @@ if (newAText.text === this.atext.text && newAText.attribs === this.atext.attribs
 }
 ```
 
-### 4.7 客户端 rev 与服务端 sessioninfo.rev 的对应关系
+### 4.7 客户端 rev 与服务端 sessioninfo.rev 的对应关系（非强一致，最终一致）
 
-客户端和服务端各自独立维护修订号追踪，但保持同步：
+客户端和服务端各自独立维护修订号追踪，但设计目标是最终一致：
 
 | 变量 | 所在位置 | 更新时机 |
 |------|----------|----------|
 | 客户端 `rev` | [collab_client.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/static/js/collab_client.ts) 闭包变量 | 收到 `ACCEPT_COMMIT` 或 `NEW_CHANGES` 时更新 |
-| 服务端 `sessioninfo.rev` | [PadMessageHandler.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/node/handler/PadMessageHandler.ts) `sessioninfos[socket.id].rev` | 发送 `ACCEPT_COMMIT` 后立即更新，或 `updatePadClients()` 发送 `NEW_CHANGES` 后更新 |
+| 服务端 `sessioninfo.rev` | [PadMessageHandler.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/node/handler/PadMessageHandler.ts) `sessioninfos[socket.id].rev` | 发送 `ACCEPT_COMMIT` **之后立即**更新，或 `updatePadClients()` 发送 `NEW_CHANGES` **之后**更新 |
 
-两者在正常情况下始终相等，因为：
-- 提交者：`ACCEPT_COMMIT` 发送后，服务端先更新 `sessioninfo.rev`，客户端后收到消息更新 `rev`
-- 协作者：`NEW_CHANGES` 发送后，服务端在 while 循环内更新 `sessioninfo.rev`，客户端异步处理时更新 `rev`
+**⚠️ 重要修正：两者并非在所有时刻都相等**：
+- 服务端先发送 `ACCEPT_COMMIT`，再更新 `sessioninfo.rev`，最后调用 `updatePadClients()`
+- 客户端在收到消息后才更新 `rev`
+- 两者之间存在**网络 RTT + 服务端处理耗时**的不一致窗口（几十到几百毫秒）
+- 消息校验失败（bad revision）时会永久不一致
+- 重连期间会短暂不一致
+- 但在正常流程完成后，两者最终会对齐
 
 ### 4.8 完整消息流转图（修订版）
 
@@ -1082,7 +1088,7 @@ socket.join(sessionInfo.padId);
 await exports.updatePadClients(pad);
 ```
 
-在 `socket.join()` 之前，其他用户的广播这个新客户端是收不到的，所以需要主动调用 `updatePadClients()` 补发。这也从侧面说明：**一旦加入房间，客户端会收到包括自己提交在内的所有广播消息，但通过 rev 跟踪机制避免重复处理。**
+在 `socket.join()` 之前，其他用户的广播这个新客户端是收不到的，所以需要主动调用 `updatePadClients()` 补发。这也从侧面说明：**一旦加入房间，客户端会被纳入 `updatePadClients()` 的遍历范围，但是否实际收到 NEW_CHANGES 取决于 `sessioninfo.rev < pad.head` 的条件——提交者在正常无 correction 的场景下，由于 `thisSession.rev` 已提前更新为 newRev，不会收到自己那次变更的 NEW_CHANGES。**
 
 ---
 
