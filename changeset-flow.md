@@ -754,6 +754,281 @@ DOM = apply(postChange)                                ← 反映位置调整
 
 信息来自外部，需要与本地状态协调，所以需要操作转换。
 
+### 4.10 消息不乱序的四层保证
+
+客户端永远不会乱序处理 `ACCEPT_COMMIT` 和 `NEW_CHANGES`，这是由四层机制共同保证的：
+
+#### 第一层：服务端同一 pad 的变更串行处理
+
+服务端通过 `Channels` 类确保**同一 pad 的 `USER_CHANGES` 消息串行处理**：
+
+```javascript
+// PadMessageHandler.ts L171-L202
+class Channels {
+  async enqueue(ch, task) {
+    const p = (this._promiseChains.get(ch) || Promise.resolve())
+        .then(() => this._exec(ch, task));
+    // ...
+    this._promiseChains.set(ch, pc);
+    return await p;
+  }
+}
+
+// 每个 pad 一个串行队列
+const padChannels = new Channels(
+  (ch, {socket, message}) => handleUserChanges(socket, message)
+);
+```
+
+当用户 A 和用户 B 几乎同时提交变更时：
+1. A 的 `USER_CHANGES` 先进入队列，开始执行 `handleUserChanges(A)`
+2. B 的 `USER_CHANGES` 后进入队列，**必须等 A 的处理完全结束（包括 ACCEPT_COMMIT 和 updatePadClients 全部完成）**才能开始
+3. 串行执行保证：A 的 `ACCEPT_COMMIT` 和 `NEW_CHANGES` 全部发送完成后，才会开始处理 B 的变更
+
+这避免了 "A 的 ACCEPT_COMMIT 在 B 的 NEW_CHANGES 之后到达" 这种极端乱序场景。
+
+#### 第二层：同一 handleUserChanges 内的发送顺序保证
+
+在同一个 `handleUserChanges` 执行中，代码顺序是严格的：
+
+```javascript
+// PadMessageHandler.ts L976-L986
+// 断言：在发送前，sessioninfo.rev 还停留在 r（重基前的版本）
+assert.equal(thisSession.rev, r);
+
+// ① 先发 ACCEPT_COMMIT
+socket.emit('message', {type: 'COLLABROOM', data: {type: 'ACCEPT_COMMIT', newRev}});
+
+// ② 立即更新 sessioninfo.rev
+thisSession.rev = newRev;
+
+// ③ 后调用 updatePadClients 发送 NEW_CHANGES
+await exports.updatePadClients(pad);
+```
+
+发送顺序是**程序级别的先后顺序**：先 `socket.emit(ACCEPT_COMMIT)`，再 `await updatePadClients()`。代码中的注释明确指出了这一点：
+> "The client assumes that ACCEPT_COMMIT and NEW_CHANGES messages arrive in order. Make sure we have already sent any previous ACCEPT_COMMIT and NEW_CHANGES messages."
+
+#### 第三层：Socket.IO 同一连接的 FIFO 保证
+
+Socket.IO（基于 WebSocket/长轮询）在**同一个 socket 连接**上保证消息按发送顺序到达。即：
+- 服务端先发 M1，再发 M2
+- 客户端一定先收到 M1，再收到 M2
+
+对于提交者来说，`ACCEPT_COMMIT` 和 `NEW_CHANGES`（如果有）通过**同一个 socket 连接**发送，所以它们的到达顺序与发送顺序完全一致。
+
+#### 第四层：客户端 serverMessageTaskQueue 串行处理
+
+即使由于某些极端原因（如 TCP 分包重组）消息到达顺序有波动（实际上 Socket.IO 已保证），客户端还有 `serverMessageTaskQueue` 确保**按到达顺序逐个处理**：
+
+```javascript
+// collab_client.ts L187-L200
+const serverMessageTaskQueue = new class {
+  constructor() {
+    this._promiseChain = Promise.resolve();
+  }
+
+  async enqueue(fn) {
+    const taskPromise = this._promiseChain.then(fn);
+    this._promiseChain = taskPromise.catch(() => {});
+    return await taskPromise;
+  }
+}();
+```
+
+`ACCEPT_COMMIT` 和 `NEW_CHANGES` 都会进入同一个队列：
+
+```javascript
+// collab_client.ts L209-L241
+if (msg.type === 'NEW_CHANGES') {
+  serverMessageTaskQueue.enqueue(async () => { /* 处理 NEW_CHANGES */ });
+} else if (msg.type === 'ACCEPT_COMMIT') {
+  serverMessageTaskQueue.enqueue(() => { /* 处理 ACCEPT_COMMIT */ });
+}
+```
+
+队列保证：
+- 先到的消息先开始处理
+- 前一个消息处理完成（包括其中的异步操作）后，才会开始下一个
+- 即使处理 NEW_CHANGES 时有 `await editor.getInInternationalComposition()`，也不会让后面的 ACCEPT_COMMIT 插队
+
+#### 乱序防御：客户端的版本校验
+
+即使四层保证全部失效（极端罕见场景），客户端还有最后一道防线——版本号校验：
+
+```javascript
+// NEW_CHANGES 处理
+if (newRev !== (rev + 1)) {
+  window.console.warn(`bad message revision on NEW_CHANGES: ${newRev} not ${rev + 1}`);
+  return;  // 跳过不合法的消息
+}
+
+// ACCEPT_COMMIT 处理
+if (![rev, rev + 1].includes(newRev)) {
+  window.console.warn(`bad message revision on ACCEPT_COMMIT: ${newRev} not ${rev + 1}`);
+  return;  // 跳过不合法的消息
+}
+```
+
+如果收到的 `newRev` 不符合预期，消息会被丢弃，不会破坏本地状态。
+
+---
+
+### 4.11 客户端 rev 与服务端 sessioninfo.rev 的一致性分析
+
+**结论：两者在正常情况下是一致的，但并非强一致，而是**最终一致**。在某些时间窗口和异常场景下会出现短暂不一致。**
+
+#### 正常路径的一致性保证
+
+**提交者路径：**
+
+```
+服务端                              客户端
+  │                                   │
+  │ socket.emit(ACCEPT_COMMIT)        │  此时：服务端 sessioninfo.rev 已更新
+  │ thisSession.rev = newRev   │  客户端 rev 还是旧值
+  │─────── 网络传输延迟 ────────│
+  │                                   │  收到消息：rev = newRev
+  │                                   │  ← 此时两者一致
+```
+
+时间差：服务端在发送前就更新了 `sessioninfo.rev`，客户端要等消息到达后才更新 `rev`。两者之间存在**网络 RTT（往返时间）的不一致窗口**，通常几十到几百毫秒。
+
+**协作者路径：**
+
+```
+服务端                              客户端 B
+  │                                   │
+  │ while sessioninfo.rev < head:     │
+  │   socket.emit(NEW_CHANGES)        │
+  │   sessioninfo.rev = r      │  客户端 rev 还是旧值
+  │─────── 网络传输延迟 ────────│
+  │                                   │  收到消息：rev = r
+  │                                   │  ← 此时两者一致
+```
+
+同样存在 RTT 级别的短暂不一致。
+
+#### 可能出现不一致的场景
+
+| 场景 | 说明 | 是否最终一致 |
+|------|------|-------------|
+| **网络传输途中** | 服务端已更新 sessioninfo.rev，消息在网络上，客户端尚未收到 | ✅ 是 |
+| **客户端队列排队** | 消息已到达客户端，但 serverMessageTaskQueue 中还有前面的任务未处理完 | ✅ 是 |
+| **重连期间** | 客户端断开重连，在 CLIENT_RECONNECT 完成前两者不同步 | ✅ 是（重连后补发） |
+| **消息校验失败被丢弃** | newRev 不符合预期，打 warn 后 return，不更新客户端 rev | ❌ 永久不一致（但被注释的 disconnect 本应处理） |
+| **客户端主动重发** | 客户端超时后重传 USER_CHANGES，服务端检测为重传，返回 newRev 等于当前 rev | ✅ 是 |
+
+#### 代码中故意不一致的处理：坏消息只 warn 不 disconnect
+
+注意到在 `NEW_CHANGES` 和 `ACCEPT_COMMIT` 的校验失败分支中：
+
+```javascript
+if (newRev !== (rev + 1)) {
+  window.console.warn(`bad message revision on NEW_CHANGES: ${newRev} not ${rev + 1}`);
+  // setChannelState("DISCONNECTED", "badmessage_newchanges");
+  return;
+}
+```
+
+**原本的 disconnect 被注释掉了**，只打 warn 然后 return。这意味着：
+- 这个坏消息会被跳过，**不会更新客户端 rev**
+- 但服务端的 `sessioninfo.rev` 已经更新了
+- 此时两者永久不一致，后续的 NEW_CHANGES 都会因为 newRev !== rev+1 而被跳过
+- 客户端进入"消息黑洞"状态，但不会断开
+
+这是一个已知的缺陷——当前实现选择"尽量不崩溃"而不是"强制重连恢复一致"。
+
+#### 重连恢复机制
+
+当客户端重连时，会通过 `CLIENT_RECONNECT` 消息重新同步：
+
+```javascript
+// 客户端 getMissedChanges() 返回当前状态
+const getMissedChanges = () => {
+  const obj = {};
+  obj.baseRev = rev;
+  if (committing && stateMessage) {
+    obj.committedChangeset = stateMessage.changeset;
+    editor.applyPreparedChangesetToBase();  // 先把 submitted 并入 base
+  }
+  const userChangesData = prepareUserChangeset();
+  if (userChangesData.changeset) {
+    obj.furtherChangeset = userChangesData.changeset;
+  }
+  return obj;
+};
+```
+
+服务端收到 `CLIENT_RECONNECT` 后，会从 `client_rev` 开始补发所有缺失的修订，确保两者重新对齐。
+
+---
+
+### 4.12 为什么 pad 房间包含提交者自己的连接
+
+`_getRoomSockets(padId)` 返回的是 pad 房间内**所有 socket**，包括提交者自己的 socket。这不是 bug，而是有意的设计。
+
+#### 原因一：correction changeset 需要广播给提交者
+
+服务端的 `_correctMarkersInPad()` 会自动修正行标记位置（如列表标记 `*` 不在行首的情况），产生额外的修订：
+
+```javascript
+// PadMessageHandler.ts L971-L974
+const correctionChangeset = _correctMarkersInPad(pad.atext, pad.pool);
+if (correctionChangeset) {
+  await pad.appendRevision(correctionChangeset, thisSession.author);
+  // pad.head 从 N+1 变成 N+2
+}
+```
+
+此时 `ACCEPT_COMMIT` 只确认了用户自己的变更（newRev = N+1），但 correction 修订（N+2）也需要通知提交者。提交者的 socket 在房间内，`updatePadClients()` 的 while 循环会检测到：
+```
+sessioninfo.rev(N+1) < pad.head(N+2) → 发送 NEW_CHANGES(r=N+2)
+```
+提交者通过 `applyChangesToBase()` 接收并应用这个自动修正。
+
+#### 原因二：统一的广播机制，降低代码复杂度
+
+如果 `updatePadClients()` 要排除提交者，需要额外的判断逻辑：
+```javascript
+// 伪代码：需要额外判断
+if (socket.id !== submitterSocketId) {
+  socket.emit('message', msg);
+}
+```
+
+而且还需要传递 `submitterSocketId` 到 `updatePadClients()` 中，增加了函数耦合。当前设计：
+- 提交者不会收到自己的变更（因为 sessioninfo.rev 已更新）
+- 有 correction 时会自然收到
+- 其他协作者按正常流程接收
+- 代码不需要特殊分支，简洁可靠
+
+#### 原因三：后续其他用户的变更也需要广播给提交者
+
+提交者提交完成后，仍然是 pad 的协作者之一，后续其他用户的变更也需要通过房间广播给他。
+
+#### 佐证：客户端加入房间的时机
+
+客户端在 `CLIENT_READY` 处理中加入房间：
+
+```javascript
+// PadMessageHandler.ts L1389-L1390
+// Join the pad and start receiving updates
+socket.join(sessionInfo.padId);
+```
+
+然后才发送 `CLIENT_VARS` 和初始化 `sessionInfo.rev`。注意注释说明：
+
+```javascript
+// PadMessageHandler.ts L1409-L1412
+// Flush any revisions that may have been appended while we were awaiting the
+// clientVars hook (before socket.join).  Those revisions were broadcast to
+// existing room members but this socket hadn't joined yet so it missed them.
+await exports.updatePadClients(pad);
+```
+
+在 `socket.join()` 之前，其他用户的广播这个新客户端是收不到的，所以需要主动调用 `updatePadClients()` 补发。这也从侧面说明：**一旦加入房间，客户端会收到包括自己提交在内的所有广播消息，但通过 rev 跟踪机制避免重复处理。**
+
 ---
 
 ## 五、完整状态流转图
