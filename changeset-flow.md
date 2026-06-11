@@ -296,23 +296,32 @@ async appendRevision(aChangeset, authorId = '') {
 }
 ```
 
-### 2.5 确认与广播
+### 2.5 确认与广播（精确执行顺序）
 
-处理完变更后，服务端做两件事：
+处理完变更后，服务端按以下**精确顺序**执行三个关键操作（见 [PadMessageHandler.ts#L983-L986](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/node/handler/PadMessageHandler.ts#L983-L986)）：
 
 1. **给提交者发确认**：
 ```javascript
+// 第 1 步：发出 ACCEPT_COMMIT 消息
 socket.emit('message', {
   type: 'COLLABROOM',
   data: { type: 'ACCEPT_COMMIT', newRev }
 });
-thisSession.rev = newRev;
-```
 
-2. **给所有客户端广播新变更**：
-```javascript
+// 第 2 步：立即更新提交者的服务端会话 rev
+// 注意：thisSession 是 sessioninfos[socket.id] 的引用（同一个对象），
+// 所以修改 thisSession.rev 等价于修改 sessioninfos[socket.id].rev
+thisSession.rev = newRev;
+if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
+
+// 第 3 步：广播给所有客户端
 await exports.updatePadClients(pad);
 ```
+
+**关键细节**：
+- **执行顺序是严格的**：先 `socket.emit(ACCEPT_COMMIT)`，再更新 `thisSession.rev`，最后才调用 `updatePadClients()`
+- **对象引用机制**：`const thisSession = sessioninfos[socket.id]` 保存的是引用而非副本，所以第 2 步对 `thisSession.rev` 的修改会立即反映在 `sessioninfos[socket.id]` 上
+- 当第 3 步 `updatePadClients()` 内部遍历 `sessioninfos[socket.id]` 时，拿到的 `rev` **已经是 newRev 了**
 
 ---
 
@@ -334,6 +343,9 @@ exports.updatePadClients = async (pad) => {
     if (sessioninfo == null) return;
 
     // 逐个发送客户端缺失的修订
+    // ★ 对于提交者：由于 handleUserChanges 中已经执行过 thisSession.rev = newRev，
+    //   而 thisSession 和 sessioninfos[socket.id] 是同一个对象引用，
+    //   所以这里拿到的 sessioninfo.rev 已经是 newRev 了
     while (sessioninfo.rev < pad.getHeadRevisionNumber()) {
       const r = sessioninfo.rev + 1;
       let revision = revCache[r];
@@ -367,6 +379,8 @@ exports.updatePadClients = async (pad) => {
 - 每个会话独立跟踪自己的 `rev`（已收到的修订号）
 - 使用 `revCache` 缓存修订数据，避免多次数据库查询
 - 按修订号顺序发送，保证客户端接收有序
+- **提交者不会收到自己原始变更的 NEW_CHANGES**：因为调用 `updatePadClients()` 时，提交者的 `sessioninfo.rev` 已被设置为 `newRev`，while 条件 `sessioninfo.rev < pad.getHeadRevisionNumber()` 在无 correction 时不成立
+- **有 correction 时提交者会收到 correction 的 NEW_CHANGES**：因为 pad.head = newRev + 1（比 newRev 大），while 条件成立
 
 ### 3.2 客户端接收协作者变更
 
@@ -493,7 +507,12 @@ if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
 await exports.updatePadClients(pad);
 ```
 
-**关键发现**：服务端先发 `ACCEPT_COMMIT` 给提交者，再调用 `updatePadClients()`。而 `updatePadClients()` 遍历的是 pad 房间内的 **所有 socket**（包括提交者自己的 socket）。所以提交者会不会再收到 `NEW_CHANGES`，取决于 `sessioninfo.rev` 与 `pad.head` 的关系。
+**关键发现**：服务端的执行顺序是：
+1. 先 `socket.emit(ACCEPT_COMMIT)` 给提交者
+2. 再更新 `thisSession.rev = newRev`（由于 thisSession 是 sessioninfos[socket.id] 的引用，sessioninfos 中对应项同步更新）
+3. 最后才调用 `updatePadClients()` 广播给所有客户端（包括提交者自己的 socket）
+
+所以提交者会不会再收到 `NEW_CHANGES`，取决于调用 `updatePadClients()` 时，提交者的 `sessioninfo.rev` 与 `pad.head` 的关系——而此时提交者的 `sessioninfo.rev` 已经在第 2 步被更新为 `newRev` 了。
 
 ### 4.3 提交者的消息路径（无 correction 的情况）
 
@@ -515,6 +534,7 @@ await exports.updatePadClients(pad);
   │                                                    │  ┊ handleUserChanges() 检查新变更
   │                                                    │
   │ ② thisSession.rev = N+1                           │
+  │    (thisSession 是 sessioninfos[socket.id] 的引用)│
   │                                                    │
   │ ③ updatePadClients(pad)                            │
   │    遍历所有 socket（包含 A）                        │
@@ -522,6 +542,8 @@ await exports.updatePadClients(pad);
   │    ❌ 不满足，不发送 NEW_CHANGES                    │
   │                                                    │
 ```
+
+**更正说明**：之前可能误解为 sessioninfo.rev 在 emit 前更新，但实际代码顺序是先 emit ACCEPT_COMMIT（步骤①），再更新 thisSession.rev（步骤②），最后调用 updatePadClients（步骤③）。由于步骤②先于步骤③执行，且 thisSession 和 sessioninfos[socket.id] 是同一个对象引用，因此步骤③遍历到提交者时 sessioninfo.rev 已经是 N+1。
 
 **结论**：在无 correction changeset 的情况下，提交者 **只收到 `ACCEPT_COMMIT`**，不会收到关于自己变更的 `NEW_CHANGES`。
 
@@ -575,7 +597,7 @@ await exports.updatePadClients(pad);
   │                                                    │ rev: N → N+1           │
   │                                                    │ acceptCommit()         │
   │                                                    │                        │
-  │ ② thisSession.rev = N+1                            │                        │
+  │ ② thisSession.rev = N+1  (对象引用)                │                        │
   │                                                    │                        │
   │ ③ updatePadClients(pad)                            │                        │
   │                                                    │                        │
@@ -678,12 +700,18 @@ if (newAText.text === this.atext.text && newAText.attribs === this.atext.attribs
   ├─ (可能的 correction → pad.head = N+2)
   │
   ├─ ① 发送 ACCEPT_COMMIT(newRev) → 提交者 A
-  │     服务端: thisSession.rev = newRev
   │
-  └─ ② updatePadClients(pad)
+  ├─ ② 更新提交者 A 的服务端会话 rev
+  │     thisSession.rev = newRev
+  │     (thisSession 是 sessioninfos[socket.id] 的引用，
+  │      sessioninfos 中对应条目立即同步更新)
+  │
+  └─ ③ updatePadClients(pad)
        │
        ├─ 对提交者 A:
        │    while sessioninfo.rev < pad.head:
+       │      (sessioninfo 与 thisSession 是同一个对象，
+       │       sessioninfo.rev 已经是 newRev)
        │      无 correction: sessioninfo.rev(N+1) = pad.head(N+1) → 跳过
        │      有 correction: 发送 NEW_CHANGES(N+2) → A 收到后 applyChangesToBase
        │
@@ -799,15 +827,23 @@ assert.equal(thisSession.rev, r);
 // ① 先发 ACCEPT_COMMIT
 socket.emit('message', {type: 'COLLABROOM', data: {type: 'ACCEPT_COMMIT', newRev}});
 
-// ② 立即更新 sessioninfo.rev
+// ② 立即更新提交者的 session rev
+// ★ 更正：thisSession 是 sessioninfos[socket.id] 的对象引用，
+//   此处修改后，sessioninfos 中的数据立即更新
 thisSession.rev = newRev;
+if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
 
 // ③ 后调用 updatePadClients 发送 NEW_CHANGES
+// ★ 关键：此时提交者的 sessioninfo.rev 已经是 newRev，
+//   所以 updatePadClients 内 while 循环条件对提交者不成立（无 correction 时），
+//   不会给提交者发送关于自己原始变更的 NEW_CHANGES
 await exports.updatePadClients(pad);
 ```
 
-发送顺序是**程序级别的先后顺序**：先 `socket.emit(ACCEPT_COMMIT)`，再 `await updatePadClients()`。代码中的注释明确指出了这一点：
+发送顺序是**程序级别的先后顺序**：先 `socket.emit(ACCEPT_COMMIT)` → 更新 `thisSession.rev` → 再 `await updatePadClients()`。代码中的注释明确指出了这一点：
 > "The client assumes that ACCEPT_COMMIT and NEW_CHANGES messages arrive in order. Make sure we have already sent any previous ACCEPT_COMMIT and NEW_CHANGES messages."
+
+**关键更正**：之前若误以为 "先更新 rev 再发 ACCEPT_COMMIT" 是不准确的。实际顺序是先发出 ACCEPT_COMMIT，再更新 rev，最后广播。由于 JavaScript 单线程执行，这三步之间不会被打断，且 thisSession 与 sessioninfos[socket.id] 指向同一个对象，因此当 updatePadClients 内部读取 sessioninfos[socket.id].rev 时已经拿到新值了。
 
 #### 第三层：Socket.IO 同一连接的 FIFO 保证
 
@@ -885,14 +921,23 @@ if (![rev, rev + 1].includes(newRev)) {
 ```
 服务端                              客户端
   │                                   │
-  │ socket.emit(ACCEPT_COMMIT)        │  此时：服务端 sessioninfo.rev 已更新
-  │ thisSession.rev = newRev   │  客户端 rev 还是旧值
-  │─────── 网络传输延迟 ────────│
-  │                                   │  收到消息：rev = newRev
+  │ socket.emit(ACCEPT_COMMIT)        │  此时：服务端 sessioninfo.rev 还是旧值 r
+  │─────── 网络传输 ────────          │
+  │                                   │
+  │ thisSession.rev = newRev    │  客户端 rev 还是旧值 r
+  │ (对象引用)                      │
+  │                                   │
+  │ await updatePadClients()          │
+  │ (读取 sessioninfo.rev             │
+  │  已是 newRev，所以不              │
+  │  给提交者发原始变更)              │
+  │─────── 网络传输 ────────          │
+  │                                   │  收到 ACCEPT_COMMIT：
+  │                                   │  rev = newRev
   │                                   │  ← 此时两者一致
 ```
 
-时间差：服务端在发送前就更新了 `sessioninfo.rev`，客户端要等消息到达后才更新 `rev`。两者之间存在**网络 RTT（往返时间）的不一致窗口**，通常几十到几百毫秒。
+时间差：服务端先发出 ACCEPT_COMMIT 消息，再更新 `sessioninfo.rev`，最后广播。客户端要等 ACCEPT_COMMIT 到达后才更新 `rev`。两者之间存在**网络 RTT（往返时间）+ 服务端几步同步操作耗时**的不一致窗口，通常几十到几百毫秒。
 
 **协作者路径：**
 
@@ -987,19 +1032,29 @@ sessioninfo.rev(N+1) < pad.head(N+2) → 发送 NEW_CHANGES(r=N+2)
 ```
 提交者通过 `applyChangesToBase()` 接收并应用这个自动修正。
 
-#### 原因二：统一的广播机制，降低代码复杂度
+#### 原因二：通过 rev 跟踪自然避免重复，无需特殊排除
+
+**关键机制**：服务端在调用 `updatePadClients()` **之前**，已经先更新了 `thisSession.rev = newRev`，而 `thisSession` 与 `sessioninfos[socket.id]` 是**同一个对象引用**。因此当 `updatePadClients()` 内部遍历提交者的 socket 时：
+
+```javascript
+const sessioninfo = sessioninfos[socket.id];  // 拿到的就是 thisSession（同一个对象）
+while (sessioninfo.rev < pad.getHeadRevisionNumber()) {
+  // 无 correction 时：sessioninfo.rev(newRev) = pad.head(newRev) → 条件不成立，跳过
+  // 有 correction 时：sessioninfo.rev(newRev) < pad.head(newRev+1) → 条件成立，发送 correction
+}
+```
 
 如果 `updatePadClients()` 要排除提交者，需要额外的判断逻辑：
 ```javascript
-// 伪代码：需要额外判断
+// 伪代码：需要额外判断和传参
 if (socket.id !== submitterSocketId) {
   socket.emit('message', msg);
 }
 ```
 
 而且还需要传递 `submitterSocketId` 到 `updatePadClients()` 中，增加了函数耦合。当前设计：
-- 提交者不会收到自己的变更（因为 sessioninfo.rev 已更新）
-- 有 correction 时会自然收到
+- 无 correction 时，提交者自动不会收到自己的变更（rev 自然对齐）
+- 有 correction 时会自然收到修正修订
 - 其他协作者按正常流程接收
 - 代码不需要特殊分支，简洁可靠
 
