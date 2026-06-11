@@ -145,7 +145,168 @@ if (!auth) {
 5. **安全检查**（在 CLIENT_READY 之后、进入房间之前执行）：`securityManager.checkAccess()` 返回 `accessStatus` 和 `authorID`。若 authorID 在连接过程中改变，直接断开 `disconnect: 'rejected'`。
 6. **加入房间**：在 `handleClientReady()` 内执行 `socket.join(sessionInfo.padId)`，把 socket 加入以 padId 命名的 Socket.IO Room——这是后续房间广播的基础。
 
-### 2.3 重复作者检测（Stale Tab 踢下线）
+### 2.3 handleClientReady：首次连接 vs 重连恢复（两条路径详解）
+
+`handleClientReady` 函数（[PadMessageHandler.ts#L1107-L1477](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1107-L1477)）根据客户端 `CLIENT_READY` 消息中的 `reconnect` 字段走两条不同的分支。
+
+客户端何时发送 reconnect：[pad.ts#L344-L348](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/pad.ts#L344-L348)
+
+```javascript
+// 发生网络抖动后 socket 重新连上时：
+if (isReconnect) {
+  msg.client_rev = pad.collabClient.getCurrentRevisionNumber();
+  msg.reconnect = true;
+}
+```
+
+#### 2.3.1 公共前置步骤（两条路径都执行）
+
+在进入分支判断前，`handleClientReady` 会先完成一系列共用操作：
+
+1. 保存/更新作者名与颜色（`authorManager.setAuthorName/ColorId`）
+2. 加载 pad 对象、所有作者数据、历史作者信息（颜色+名称）
+3. 重复作者检测（见下一节 2.4）
+4. 写访问日志 `[ENTER]` / `[CREATE]`
+
+之后才按 `message.reconnect` 分支。
+
+---
+
+#### 2.3.2 路径 A：重连恢复（`reconnect === true`）
+
+代码位置：[PadMessageHandler.ts#L1197-L1258](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1197-L1258)
+
+```typescript
+if (message.reconnect) {
+  socket.join(sessionInfo.padId);                        // ① 重新加入房间
+  sessionInfo.rev = message.client_rev;                  // ② 以客户端上报的 rev 作为基线
+  // ③ 计算 [client_rev+1, pad.head] 范围内的缺失 revisions
+  // ④ 从数据库批量加载 changeset / author / timestamp
+  // ⑤ 逐条发送 CLIENT_RECONNECT 消息
+}
+```
+
+**为什么不再发送 CLIENT_VARS？**
+
+重连的前提是客户端页面尚未刷新，内存中仍然保留着：
+- 完整的 pad 文档内容（`atext`）与属性池
+- 插件列表、用户列表、pad 设置等所有初始变量
+- collab_client 的状态机（baseRev、待提交队列等）
+
+发送 `CLIENT_VARS` 会让客户端重新初始化整个编辑器——清空当前输入、重建 DOM、重置光标位置，这在重连场景下是不可接受的。用户的期望是"短暂断网后继续打字，感觉不到掉线"，所以重连分支只补**增量 changeset**。
+
+**重连分支向客户端发送的消息：**
+
+对每条缺失 revision（从 `client_rev + 1` 到 `pad.head`）发送一条：
+
+```javascript
+{
+  type: 'COLLABROOM',
+  data: {
+    type: 'CLIENT_RECONNECT',
+    headRev: pad.getHeadRevisionNumber(),   // 当前最新 revision
+    newRev: r,                                // 本条消息对应的 revision 号
+    changeset: forWire.translated,           // 序列化后的 changeset
+    apool: forWire.pool,                      // 该 changeset 涉及的属性池切片
+    author: changesets[r].author,            // 该 revision 的作者
+    currentTime: changesets[r].timestamp     // 该 revision 的时间戳
+  }
+}
+```
+
+如果期间没有任何新 revision（`startNum === endNum`），则发送一条 `noChanges: true` 的消息：
+
+```javascript
+{
+  type: 'COLLABROOM',
+  data: {
+    type: 'CLIENT_RECONNECT',
+    noChanges: true,
+    newRev: pad.getHeadRevisionNumber()
+  }
+}
+```
+
+**注意**：重连分支不设置 `sessionInfo.time`，也不调用 `updatePadClients`——因为消息已经直接在本分支里逐条发出了。
+
+---
+
+#### 2.3.3 路径 B：首次连接 / 刷新页面（`reconnect` 为 false / 未设置）
+
+代码位置：[PadMessageHandler.ts#L1259-L1413](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1259-L1413)
+
+这是普通首次打开页面或刷新页面的场景。客户端内存里没有任何 pad 状态，必须从零构建。
+
+```typescript
+else {
+  // ① 原子快照：同时读取 pad.head 和 atext，避免两者不一致
+  headRev = pad.getHeadRevisionNumber();
+  atext = cloneAText(pad.atext);
+
+  // ② 组装庞大的 clientVars 对象
+
+  // ③ 调用 clientVars 插件 hook（可能有异步操作）
+  await hooks.aCallAll('clientVars', {clientVars, pad, socket});
+
+  // ④ 加入房间
+  socket.join(sessionInfo.padId);
+
+  // ⑤ 发送 CLIENT_VARS
+  socket.emit('message', {type: 'CLIENT_VARS', data: clientVars});
+
+  // ⑥ 记录当前已同步到客户端的 rev 和 time
+  sessionInfo.rev = headRev;
+  sessionInfo.time = await pad.getRevisionDate(headRev);
+
+  // ⑦ ★ 补发：推送在 ③④ 期间新增的 revisions
+  await exports.updatePadClients(pad);
+}
+```
+
+**为什么 `socket.join` 之后还要再次 `updatePadClients`？**
+
+关键在于步骤 ③ 的 `hooks.aCallAll('clientVars', ...)` 是**异步**的，可能耗时很长（插件做 DB 查询、HTTP 请求等）。同时在 ① 到 ④ 之间，也可能有其他客户端在提交编辑。
+
+这段时间窗口内发生的事：
+- 步骤 ① 拍快照时 `pad.head = N`
+- 步骤 ③ 插件 hook 执行期间，可能已有其他用户提交了编辑，`pad.head` 推进到了 `N + k`
+- 这些新 revision 在步骤 ③ 之前就通过 `updatePadClients` 向房间内已有的 socket 做了广播
+- **但本 socket 在步骤 ④ 才 `socket.join(padId)`，之前广播的 NEW_CHANGES 它一条也收不到**
+- 步骤 ⑤ 发出去的 `CLIENT_VARS` 只包含了 snapshot at rev `N`，缺了 `N+1` ~ `N+k`
+
+所以步骤 ⑦ 的 `await exports.updatePadClients(pad)` 就是专门用来填补这个窗口的。它遍历 `roomSockets`，发现 `sessionInfo.rev (N) < pad.head (N+k)`，就把 `N+1` ~ `N+k` 的 `NEW_CHANGES` 逐条推送给本 socket。
+
+代码里的注释也明确说明了这一点：[PadMessageHandler.ts#L1409-L1412](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1409-L1412)
+
+> *Flush any revisions that may have been appended while we were awaiting the clientVars hook (before socket.join). Those revisions were broadcast to existing room members but this socket hadn't joined yet so it missed them.*
+
+**首次连接分支向客户端发送的消息：**
+
+| 消息类型 | 内容概览 | 发送时机 |
+|----------|----------|----------|
+| `CLIENT_VARS` | 完整初始状态：`initialAttributedText`（atext + apool at headRev）、`historicalAuthorData`、`collab_client_vars.rev/time`、`chatHead`、`savedRevisions`、插件列表、用户信息、pad 设置、各种开关与 UI 配置、删除 token 等 | ⑤ `socket.emit` 单播 |
+| `NEW_CHANGES`（若干条） | 每条对应一个缺失的 revision：`newRev`、`changeset`、`apool`、`author`、`currentTime`、`timeDelta` | ⑦ `updatePadClients` 内逐条单播 |
+
+另外在两条分支**之后**（函数末尾），还会向客户端发送：
+
+| 消息 | 方向 | 说明 |
+|------|------|------|
+| `USER_NEWINFO`（其他用户给新用户） | 其他用户 → 新用户（单播） | 遍历房间内其他 socket，把每个在线用户的颜色/名称/userId 发给新用户 |
+| `USER_NEWINFO`（新用户给其他人） | 新用户 → 房间内其他人（broadcast） | `socket.broadcast.to(padId)` 通知其他用户有新成员加入 |
+
+#### 2.3.4 两条路径消息对比
+
+| 维度 | 重连恢复（reconnect=true） | 首次连接 / 刷新 |
+|------|---------------------------|------------------|
+| 发送 `CLIENT_VARS`？ | ❌ 不发送（客户端保留内存状态） | ✅ 发送（从零构建完整文档与 UI 状态） |
+| 基线 revision 来源 | 客户端上报 `message.client_rev` | 服务端拍快照时的 `pad.getHeadRevisionNumber()` |
+| 缺失 revision 消息类型 | `CLIENT_RECONNECT` | `NEW_CHANGES` |
+| 缺失 revision 发送方式 | 在本分支内直接 for 循环 `socket.emit` | 调用通用的 `updatePadClients(pad)` |
+| 是否设置 `sessionInfo.time` | ❌ 不设置 | ✅ 用 headRev 的时间戳初始化（否则 timeDelta=NaN） |
+| 是否触发 `clientVars` 插件 hook | ❌ 不触发 | ✅ 触发（允许插件注入初始变量） |
+| 原子快照（atext + headRev） | ❌ 不需要 | ✅ 需要（避免文档与 revision 号不一致，见 issue #4040） |
+
+### 2.4 重复作者检测（Stale Tab 踢下线）
 
 [PadMessageHandler.ts#L1169-L1186](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1169-L1186)
 
@@ -155,7 +316,7 @@ if (!auth) {
 
 已认证用户（SSO / basic auth）和 embed 模式不受此限制。
 
-### 2.4 断开清理
+### 2.5 断开清理
 
 [PadMessageHandler.ts#L246-L287](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L246-L287)
 
