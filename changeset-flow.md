@@ -448,7 +448,315 @@ applyChangesToBase: (c, optAuthor, apoolJsonObj) => {
 
 ---
 
-## 四、完整状态流转图
+## 四、提交者 vs 协作者：消息接收与状态更新详解
+
+> 这是整个 changeset 流程中最容易混淆的部分：当提交者的变更被服务端接受后，提交者的本地基线如何更新？是通过 ACCEPT_COMMIT 直接回基线，还是也经过 NEW_CHANGES？协作者又如何收到变更？本节沿着代码中的 `rev`（客户端）和 `sessioninfo.rev`（服务端）逐行追踪。
+
+### 4.1 场景设定
+
+假设：
+- 当前 pad.head = N（服务端最新修订号）
+- 客户端 A（提交者）本地 rev = N，向服务端提交 changeset
+- 客户端 B（协作者）本地 rev = N，未提交任何变更
+- 没有 correction changeset（先看最简单的路径，后面再补充）
+
+### 4.2 服务端处理流程（逐行追踪）
+
+服务端 [handleUserChanges()](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/node/handler/PadMessageHandler.ts#L808-L995) 中，关键的确认与广播代码：
+
+```javascript
+// 第 966 行：追加修订到 pad
+const newRev = await pad.appendRevision(rebasedChangeset, thisSession.author);
+// newRev = N+1（有实际变更时），或 N（恒等变更时）
+assert([r, r + 1].includes(newRev));
+
+// 第 971-974 行：可能的修正修订（correction changeset，如行标记修正）
+const correctionChangeset = _correctMarkersInPad(pad.atext, pad.pool);
+if (correctionChangeset) {
+  await pad.appendRevision(correctionChangeset, thisSession.author);
+  // 如果执行了这一步，pad.head = N+2
+}
+
+// 第 978 行：断言提交者的 sessioninfo.rev 还在 r（重基前的版本）
+assert.equal(thisSession.rev, r);
+
+// ★ 第 983 行：先给提交者发 ACCEPT_COMMIT
+socket.emit('message', {type: 'COLLABROOM', data: {type: 'ACCEPT_COMMIT', newRev}});
+
+// ★ 第 984 行：更新提交者的服务端 session 追踪
+thisSession.rev = newRev;
+
+// 第 985 行：如果 newRev 推进了，更新时间戳
+if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
+
+// ★ 第 986 行：广播给所有客户端（包括提交者！）
+await exports.updatePadClients(pad);
+```
+
+**关键发现**：服务端先发 `ACCEPT_COMMIT` 给提交者，再调用 `updatePadClients()`。而 `updatePadClients()` 遍历的是 pad 房间内的 **所有 socket**（包括提交者自己的 socket）。所以提交者会不会再收到 `NEW_CHANGES`，取决于 `sessioninfo.rev` 与 `pad.head` 的关系。
+
+### 4.3 提交者的消息路径（无 correction 的情况）
+
+**前提**：无 correction changeset，`newRev = N+1`，`pad.head = N+1`
+
+时序：
+
+```
+服务端                                              客户端 A（提交者）
+  │                                                    │
+  │ ① socket.emit(ACCEPT_COMMIT, newRev=N+1)         │
+  │ ─────────────────────────────────────────────────► │
+  │                                                    │  客户端 rev: N → N+1
+  │                                                    │  acceptCommit() 执行
+  │                                                    │  ┊ applyPreparedChangesetToBase()
+  │                                                    │  ┊   baseAText += submittedChangeset
+  │                                                    │  ┊   submittedChangeset = null
+  │                                                    │  ┊ committing = false
+  │                                                    │  ┊ handleUserChanges() 检查新变更
+  │                                                    │
+  │ ② thisSession.rev = N+1                           │
+  │                                                    │
+  │ ③ updatePadClients(pad)                            │
+  │    遍历所有 socket（包含 A）                        │
+  │    检查 sessioninfo.rev (N+1) < pad.head (N+1)?    │
+  │    ❌ 不满足，不发送 NEW_CHANGES                    │
+  │                                                    │
+```
+
+**结论**：在无 correction changeset 的情况下，提交者 **只收到 `ACCEPT_COMMIT`**，不会收到关于自己变更的 `NEW_CHANGES`。
+
+提交者的本地基线更新路径是：
+1. `ACCEPT_COMMIT` → `acceptCommit()` → `applyPreparedChangesetToBase()`
+2. `applyPreparedChangesetToBase()` 将 `submittedChangeset` 应用到 `baseAText`，然后清空 `submittedChangeset`
+3. **不是**通过 `NEW_CHANGES` → `applyChangesToBase()` 的路径更新基线
+
+这两条路径的本质区别：
+
+| 路径 | 触发消息 | 基线更新方式 | 是否需要 follow 重基 |
+|------|----------|-------------|---------------------|
+| 提交者确认 | ACCEPT_COMMIT | `baseAText += submittedChangeset`（直接应用） | 不需要（因为就是自己的变更） |
+| 协作者同步 | NEW_CHANGES | `baseAText += c`（他人变更），然后 follow 重基本地变更 | 需要（把自己的变更重基到他人变更之后） |
+
+### 4.4 协作者的消息路径（无 correction 的情况）
+
+**前提**：无 correction changeset，客户端 B 的 `sessioninfo.rev = N`
+
+```
+服务端                                              客户端 B（协作者）
+  │                                                    │
+  │ ③ updatePadClients(pad)                            │
+  │    遍历所有 socket（包含 B）                        │
+  │    检查 sessioninfo.rev (N) < pad.head (N+1)?       │
+  │    ✅ 满足，发送 NEW_CHANGES                        │
+  │ ─────────────────────────────────────────────────► │
+  │                                                    │  客户端 rev: N → N+1
+  │    sessioninfo.rev = N+1                           │  editor.applyChangesToBase(cs, author, apool)
+  │                                                    │  ┊ baseAText += c
+  │                                                    │  ┊ submittedChangeset: follow(c, old) 重基
+  │                                                    │  ┊ userChangeset: follow(c2, old) 重基
+  │                                                    │  ┊ applyChangesetToDocument(postChange)
+  │                                                    │
+```
+
+**结论**：协作者 **只收到 `NEW_CHANGES`**，通过 `applyChangesToBase()` 处理，需要将服务端变更"穿过"本地的两层未确认变更。
+
+### 4.5 有 correction changeset 的情况
+
+当 `_correctMarkersInPad()` 检测到行标记位置错误时（比如列表标记不在行首），会产生一个修正 changeset：
+
+```
+服务端                                              客户端 A（提交者）       客户端 B（协作者）
+  │                                                    │                        │
+  │ appendRevision(rebased) → pad.head = N+1           │                        │
+  │ appendRevision(correction) → pad.head = N+2        │                        │
+  │                                                    │                        │
+  │ ① socket.emit(ACCEPT_COMMIT, newRev=N+1)         │                        │
+  │ ─────────────────────────────────────────────────► │                        │
+  │                                                    │ rev: N → N+1           │
+  │                                                    │ acceptCommit()         │
+  │                                                    │                        │
+  │ ② thisSession.rev = N+1                            │                        │
+  │                                                    │                        │
+  │ ③ updatePadClients(pad)                            │                        │
+  │                                                    │                        │
+  │  对 A：sessioninfo.rev (N+1) < pad.head (N+2)?     │                        │
+  │        ✅ 满足！发送 NEW_CHANGES (r=N+2)           │                        │
+  │ ─────────────────────────────────────────────────► │                        │
+  │                                                    │ rev: N+1 → N+2         │
+  │        sessioninfo.rev = N+2                       │ applyChangesToBase()   │
+  │                                                    │                        │
+  │  对 B：sessioninfo.rev (N) < pad.head (N+2)?       │                        │
+  │        ✅ 满足！发送 NEW_CHANGES (r=N+1)           │                        │
+  │ ──────────────────────────────────────────────────────────────────────────► │
+  │                                                    │               rev: N → N+1
+  │        继续：sessioninfo.rev (N+1) < pad.head (N+2)?                        │
+  │        ✅ 满足！发送 NEW_CHANGES (r=N+2)                                    │
+  │ ──────────────────────────────────────────────────────────────────────────► │
+  │                                                    │              rev: N+1 → N+2
+  │        sessioninfo.rev = N+2                                                │
+  │                                                    │              applyChangesToBase() ×2
+```
+
+**关键点**：
+- 有 correction 时，提交者会收到 1 条 `ACCEPT_COMMIT`（自己的变更确认）+ 1 条 `NEW_CHANGES`（correction 修订）
+- 协作者会收到 2 条 `NEW_CHANGES`（原始变更 + correction）
+- `updatePadClients` 内部的 while 循环确保按修订号顺序逐个补发
+
+### 4.6 恒等变更 (identity changeset) 的情况
+
+当客户端提交的 changeset 经过重基后变成恒等变更（如重传检测命中），`appendRevision()` 不会增加 `pad.head`：
+
+```javascript
+// Pad.appendRevision() 中：
+const newAText = applyToAText(aChangeset, this.atext, this.pool);
+if (newAText.text === this.atext.text && newAText.attribs === this.atext.attribs &&
+    this.head !== -1) {
+  return this.head;  // 返回当前 head，不增加
+}
+```
+
+此时 `newRev = r`（等于重基前的版本号），服务端仍然发送 `ACCEPT_COMMIT`：
+
+```
+服务端                                              客户端 A（提交者）
+  │                                                    │
+  │ socket.emit(ACCEPT_COMMIT, newRev=r)              │
+  │ ─────────────────────────────────────────────────► │
+  │                                                    │ 客户端处理：
+  │                                                    │ if (![rev, rev+1].includes(newRev))
+  │                                                    │   → 如果 newRev === rev，通过校验
+  │                                                    │ rev = newRev (= rev，无变化)
+  │                                                    │ acceptCommit() 正常执行
+  │                                                    │
+  │ thisSession.rev = r (= 原值)                       │
+  │                                                    │
+  │ updatePadClients(pad)                              │
+  │ 对所有客户端：sessioninfo.rev >= pad.head          │
+  │ → 不发送任何 NEW_CHANGES                           │
+```
+
+**客户端的 ACCEPT_COMMIT 处理逻辑**（[collab_client.ts#L228-L241](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/static/js/collab_client.ts#L228-L241)）：
+
+```javascript
+} else if (msg.type === 'ACCEPT_COMMIT') {
+  serverMessageTaskQueue.enqueue(() => {
+    const {newRev} = msg;
+    // newRev 可以等于 rev（恒等变更）或 rev+1（正常推进）
+    if (![rev, rev + 1].includes(newRev)) {
+      window.console.warn(`bad message revision on ACCEPT_COMMIT: ${newRev} not ${rev + 1}`);
+      return;
+    }
+    rev = newRev;
+    acceptCommit();
+  });
+}
+```
+
+### 4.7 客户端 rev 与服务端 sessioninfo.rev 的对应关系
+
+客户端和服务端各自独立维护修订号追踪，但保持同步：
+
+| 变量 | 所在位置 | 更新时机 |
+|------|----------|----------|
+| 客户端 `rev` | [collab_client.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/static/js/collab_client.ts) 闭包变量 | 收到 `ACCEPT_COMMIT` 或 `NEW_CHANGES` 时更新 |
+| 服务端 `sessioninfo.rev` | [PadMessageHandler.ts](file:///d:/fz/0601-1/solo-dogfeeding/code/1-etherpad-lite/src/node/handler/PadMessageHandler.ts) `sessioninfos[socket.id].rev` | 发送 `ACCEPT_COMMIT` 后立即更新，或 `updatePadClients()` 发送 `NEW_CHANGES` 后更新 |
+
+两者在正常情况下始终相等，因为：
+- 提交者：`ACCEPT_COMMIT` 发送后，服务端先更新 `sessioninfo.rev`，客户端后收到消息更新 `rev`
+- 协作者：`NEW_CHANGES` 发送后，服务端在 while 循环内更新 `sessioninfo.rev`，客户端异步处理时更新 `rev`
+
+### 4.8 完整消息流转图（修订版）
+
+```
+用户 A 输入文字 → 提交 USER_CHANGES(baseRev=N, cs=csA)
+  │
+  ▼
+服务端 handleUserChanges() [串行队列]
+  │
+  ├─ 校验 → moveOpsToNewPool → 重基(follow循环)
+  ├─ appendRevision(csA') → pad.head = N+1
+  ├─ (可能的 correction → pad.head = N+2)
+  │
+  ├─ ① 发送 ACCEPT_COMMIT(newRev) → 提交者 A
+  │     服务端: thisSession.rev = newRev
+  │
+  └─ ② updatePadClients(pad)
+       │
+       ├─ 对提交者 A:
+       │    while sessioninfo.rev < pad.head:
+       │      无 correction: sessioninfo.rev(N+1) = pad.head(N+1) → 跳过
+       │      有 correction: 发送 NEW_CHANGES(N+2) → A 收到后 applyChangesToBase
+       │
+       └─ 对协作者 B:
+            while sessioninfo.rev(N) < pad.head(N+1):
+              发送 NEW_CHANGES(N+1) → B 收到后 applyChangesToBase
+              sessioninfo.rev = N+1
+              (有 correction 则继续发送 N+2)
+
+═══════════════════════════════════════════════════════
+
+提交者 A 收到 ACCEPT_COMMIT:
+  │
+  ▼
+  客户端 rev: N → newRev
+  acceptCommit()
+  ├─ editor.applyPreparedChangesetToBase()
+  │   └─ baseAText = applyToAText(submittedChangeset, baseAText, apool)
+  │   └─ submittedChangeset = null
+  ├─ committing = false
+  └─ handleUserChanges()  ← 立即检查是否有新待提交变更
+
+  ⚠️ 注意：提交者的基线更新是通过直接应用 submittedChangeset，
+  而不是通过 NEW_CHANGES 的 applyChangesToBase() 路径。
+  因为 submittedChangeset 就是自己的变更，不需要 follow 重基。
+
+═══════════════════════════════════════════════════════
+
+协作者 B 收到 NEW_CHANGES:
+  │
+  ▼
+  客户端 rev: N → N+1
+  editor.applyChangesToBase(csA', author=A, apool)
+  ├─ baseAText = applyToAText(csA', baseAText, apool)
+  ├─ submittedChangeset: follow(csA', oldSubmitted, false)  ← 重基
+  ├─ c2 = follow(oldSubmitted, csA', true)
+  ├─ userChangeset: follow(c2, oldUser, true)               ← 重基
+  ├─ postChange = follow(oldUser, c2, false)
+  └─ applyChangesetToDocument(postChange)  ← 更新 DOM（光标位置自动调整）
+```
+
+### 4.9 两条基线更新路径的本质区别
+
+这是理解 Etherpad 协作机制的核心：
+
+**路径一：ACCEPT_COMMIT（提交者专有）**
+
+提交者已经知道自己的变更内容（就是 `submittedChangeset`），所以不需要通过网络重新接收。`acceptCommit()` 直接将本地的 `submittedChangeset` 合并进 `baseAText`，然后清空它。
+
+这相当于：
+```
+baseAText = baseAText + submittedChangeset
+submittedChangeset = null
+```
+没有信息丢失，不需要操作转换。
+
+**路径二：NEW_CHANGES（所有人，包括提交者收到的 correction）**
+
+接收到的变更来自他人（或服务端自动修正），本地可能有未提交的变更需要与之协调。`applyChangesToBase()` 必须使用 `follow()` 做操作转换，确保本地未提交变更的位置被正确调整。
+
+这相当于：
+```
+baseAText = baseAText + c
+submittedChangeset = follow(c, submittedChangeset)    ← 重基
+userChangeset = follow(c', userChangeset)             ← 重基
+DOM = apply(postChange)                                ← 反映位置调整
+```
+
+信息来自外部，需要与本地状态协调，所以需要操作转换。
+
+---
+
+## 五、完整状态流转图
 
 ```
                           服务器
