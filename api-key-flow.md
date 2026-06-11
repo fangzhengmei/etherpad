@@ -315,7 +315,182 @@ HTTP 401
 
 ---
 
-## 五、代码索引
+## 五、两个容易误导调用方的边界
+
+### 5.1 新版 REST API 入口的前置访问控制拦截行为
+
+新版 REST API 挂在 `expressCreateServer` 钩子，在 [express.ts#L244-L252](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/hooks/express.ts#L244-L252) 中处于 Express 中间件链的最末端：
+
+```
+expressPreSession（旧版 API 注册点）
+  ↓
+express-session
+  ↓
+webaccess.checkAccess  ←────── 新版 API 的请求会先经过这里
+  ↓
+expressCreateServer（新版 REST API 注册点）
+```
+
+而旧版 API 因为注册在 `expressPreSession`，处在 webaccess.checkAccess 的**上游**，所以旧版 API 的请求**不会**被访问控制机制拦截，直接到达 APIHandler。两套入口在这一点上行为不一致。
+
+#### 被哪一层拦下：精确到步骤的拦截路径
+
+webaccess.checkAccess 内部是一套四步的页面访问控制流程（设计初衷是给 pad 页面用的，不是给 API 用的）：
+
+```
+Step 1 preAuthorize（插件钩子，早退出机制）
+Step 2 authorize（第一次鉴权尝试）
+Step 3 authenticate（身份认证，Basic Auth + 插件）
+Step 4 authorize（第二次鉴权尝试）
+```
+
+在 `requireAuthentication=true` 的配置下，对新版 REST API 来说，**真正拦住请求的是 Step 3 末尾的 fallback 分支**。完整执行路径：
+
+```
+Step 1 preAuthorize
+  → 无插件返回结果，跳过
+
+Step 2 authorize()
+  requireAdmin = req.path.startsWith('/admin-auth') → false
+  requireAuthn = requireAdmin || settings.requireAuthentication → true
+  isAuthenticated = (req.session && req.session.user) → false（API 调用没 session）
+  → grant(false) → 返回 false → 不调用 next() → 进入 Step 3
+
+Step 3 Authenticate
+  ctx = {req, res, users: settings.users, next}
+  
+  ① 先尝试 HTTP Basic Auth 解析
+     httpBasicAuth = req.headers.authorization?.startsWith('Basic ')
+     → 对纯 API Key 调用（Authorization: <key> 或 Bearer <key> 或不带 Authorization 头）来说：false
+     → 不进入 ctx.username/ctx.password 解析分支
+
+  ② 调用 authenticate 插件钩子
+     if (!(await aCallFirst0('authenticate', ctx)))
+     → 无插件返回 false → 走 fallback
+
+  ③ fallback：HTTP Basic Auth 校验
+     判断条件：!httpBasicAuth || !ctx.username || password == null || password 不匹配
+     → 因为 httpBasicAuth=false，所以直接命中第一个条件 → 认证失败
+
+  ④ authnFailure 钩子
+     if (await aCallFirst0('authnFailure', {req, res})) return
+     → 无插件处理，继续
+
+  ⑤ authFailure 钩子（废弃别名）
+     if (await aCallFirst0('authFailure', {req, res, next})) return
+     → 无插件处理，继续
+
+  ⑥ 最终 fallback 响应
+     res.header('WWW-Authenticate', 'Basic realm="Protected Area"')
+     await sleep(1000ms)  ← 防暴力破解延迟
+     res.status(401).send('Authentication Required')
+     return ← 直接终止，不会调用 next()
+```
+
+也就是说，请求**在 Step 3 的第⑥步被终止**，永远到不了 Step 4，也到不了 `/api/2/*` 路由和 APIHandler。
+
+#### 拦下之后返回什么：精确到字节的响应
+
+| 响应部分 | 内容 |
+|---|---|
+| HTTP 状态码 | 401 |
+| 响应头 | `WWW-Authenticate: Basic realm="Protected Area"` |
+| Content-Type | `text/html; charset=utf-8`（express send 的默认值） |
+| 响应体 | 纯文本字符串 `"Authentication Required"`（15 字节，无 JSON 结构） |
+| 响应延迟 | 1 秒（`authnFailureDelayMs` 默认 1000ms，故意加的延迟防暴力破解） |
+
+⚠️ 这个响应和 APIHandler 内部鉴权失败返回的响应**格式完全不同**：
+
+| | webaccess 前置拦截 | APIHandler 内部鉴权失败 |
+|---|---|---|
+| HTTP 状态 | 401 | 401 |
+| 响应体格式 | 纯文本 `Authentication Required` | JSON `{"code":4, "message": "...", "data":null}` |
+| WWW-Authenticate 头 | 有，值为 `Basic realm="Protected Area"` | 无 |
+| 响应延迟 | 1 秒 | 无延迟（timingSafeEqual 是微秒级） |
+
+调用方如果按 API 文档期望拿到 JSON 格式的错误，会被这个纯文本响应打懵，这也是为什么很多人以为新版 API 不通的原因。
+
+#### 什么情况下不会被拦
+
+两种情况能绕开 webaccess 的前置拦截：
+
+1. **请求带了合法的 HTTP Basic Auth**（用户名密码在 `settings.users` 里）→ Basic 验证通过后写入 session → Step 4 authorize 放行 → 请求到达 APIHandler 再做 API Key/JWT 校验。相当于要过两层独立的鉴权。
+
+2. **请求带了有效的 session cookie**（浏览器先登录过同域页面）→ Step 2 直接判定已认证 → 放行。
+
+3. **配置了 `preAuthorize` / `authenticate` / `authnFailure` 插件**且插件对 API 路径做了特殊处理（这是官方推荐的扩展方式，但默认没有）。
+
+#### 结论：为什么旧版入口不会被拦
+
+因为旧版入口注册在 `expressPreSession` 钩子，它的路由在中间件链上的位置比 webaccess.checkAccess 更靠前。请求到达 `/api/1.3.0/createPad` 时，webaccess 中间件还没执行，直接被旧版路由处理了。而新版入口注册在 `expressCreateServer`，在中间件链的最末尾，所以必经 webaccess.checkAccess。
+
+这不是故意设计的 API 保护机制，而是**两套 API 在不同时期用不同钩子注册，恰好导致一个在访问控制上游、一个在下游**的副作用。
+
+
+
+### 5.2 OpenAPI 规范声明的鉴权名称与实际代码取值不一致
+
+两套入口的 OpenAPI definition（swagger/openapi spec）里都声明了 securitySchemes。声明内容和实际执行鉴权时读取的 header 名称不一致，导致调用方如果用 Swagger UI / Postman import / OpenAPI 代码生成器等工具按规范构造请求，header 方式的鉴权会**静默失败**。
+
+#### 规范里声明的是什么
+
+在 apikey 模式下，两套入口都声明了三种鉴权方案：
+
+| scheme 名 | 规范声明 | 含义（按规范） |
+|---|---|---|
+| `apiKey` | `{type:"apiKey", name:"apikey", in:"query"}` | 读 query 参数 `apikey` |
+| `apiKeyAlias` | `{type:"apiKey", name:"api_key", in:"query"}` | 读 query 参数 `api_key` |
+| **`apiKeyHeader`** | **`{type:"apiKey", name:"apikey", in:"header"}`** | **读 header 名为 `apikey` 的字段** |
+
+旧版位置：[openapi.ts#L578-L592](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/hooks/express/openapi.ts#L578-L592)
+新版位置：[RestAPI.ts#L267-L282](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/handler/RestAPI.ts#L267-L282)
+
+#### 实际代码里读的是什么
+
+两套入口的参数解析代码完全一致（新版在 [RestAPI.ts#L1478-L1481](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/handler/RestAPI.ts#L1478-L1481)，旧版在 [openapi.ts#L754-L758](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/hooks/express/openapi.ts#L754-L758)）：
+
+```javascript
+if (headers && headers.authorization) {
+  fields.authorization = fields.authorization || headers.authorization;
+}
+```
+
+读的是**小写的 `authorization` header**（即 HTTP 标准头 `Authorization`），**不是** `apikey` header。
+
+然后在 APIHandler 里拼接来源时取 `fields.authorization`：
+
+```javascript
+fields.apikey = fields.apikey || fields.api_key || fields.authorization;
+```
+
+所以通过 header 传 apikey 时，**实际有效的是 `Authorization: <你的key>`，而不是规范声明的 `apikey: <你的key>`**。
+
+#### 实际行为对照表
+
+| header 写法 | 规范声明是否匹配 | 实际是否能通过鉴权 | 原因 |
+|---|---|---|---|
+| `apikey: <你的key>` | ✅ 完全符合 apiKeyHeader scheme | **❌ 失败**，返回 401 | 代码从不读 headers.apikey，它永远不会进入 fields |
+| `Authorization: <你的key>` | ❌ 不符合任何声明的 header scheme（规范没声明 Authorization header 这种方案） | **✅ 成功** | 代码读 headers.authorization → 写入 fields → 被 apikey 拼接逻辑采纳 |
+| `Authorization: Bearer <你的key>` | ❌ | ⚠️ 看情况 | 在 API Key 模式下会把整个 `"Bearer xyz"` 当 key 去比较，除非 key 本身恰好前缀是 `Bearer `，否则不匹配；在 SSO 模式下会剥掉前缀后做 JWT 验证 |
+
+#### SSO 模式下的对应情况
+
+SSO 模式下规范声明的是 `oauth2` + authorizationCode flow。这个声明和实际代码的匹配度：
+
+- 规范声明：`type: oauth2, flows.authorizationCode`，按 OpenAPI 规范客户端会在请求里加 `Authorization: Bearer <access_token>`
+- 实际代码：读 `req.headers.authorization`，剥掉 `Bearer ` 前缀 → 做 JWT 验证
+
+**SSO 模式下规范和实际是一致的**，不会出问题。
+
+#### 影响范围总结
+
+- 仅 API Key 模式下 header 方式的鉴权有不一致问题
+- query 参数 `apikey` 和 `api_key` 在规范和代码里完全一致，没有问题
+- 用代码生成工具（如 openapi-generator）按 spec 生成的客户端，在 API Key 模式下若选择 `apiKeyHeader` 这个 scheme 作为鉴权方式，会默认发 `apikey` header，从而**永远 401**，除非调用方手动改发 `Authorization` header
+
+---
+
+## 六、代码索引
 
 | 关注点 | 文件 | 行范围 |
 |---|---|---|
