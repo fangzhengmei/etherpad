@@ -306,6 +306,457 @@ else {
 | 是否触发 `clientVars` 插件 hook | ❌ 不触发 | ✅ 触发（允许插件注入初始变量） |
 | 原子快照（atext + headRev） | ❌ 不需要 | ✅ 需要（避免文档与 revision 号不一致，见 issue #4040） |
 
+---
+
+#### 2.3.5 重连恢复的完整状态机：服务端 sessionInfo 维护 + 客户端区分自身提交与远端变更
+
+上一节对比了两条路径的宏观差异，这一节深入重连恢复的细节，回答三个问题：
+1. 服务端发送完 `CLIENT_RECONNECT` 之后，`sessionInfo.rev` 和 `sessionInfo.time` 是何时追上 `pad.head` 的？
+2. 客户端收到 `CLIENT_RECONNECT` 时如何区分"这是我自己离线期间提交的编辑"和"这是别人写的"？
+3. `isPendingRevision` 状态从 `true` 何时回到 `false`，回到正常后做了什么？
+
+##### A. 客户端侧：从断开 → 重连尝试 → pending 状态建立
+
+断开触发入口在 [pad.ts#L390-L396](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/pad.ts#L390-L396)：
+
+```javascript
+socket.on('disconnect', (reason) => {
+  socketReconnecting();
+});
+socket.io.on('reconnect_attempt', socketReconnecting); // 额外兜底
+socket.on('error', (error) => {                         // socket.io 层报错
+  pad.collabClient.setStateIdle();
+  pad.collabClient.setIsPendingRevision(true);
+});
+```
+
+`setChannelState('RECONNECTING')` 之前会调用 `socketReconnecting()`（[pad.ts#L381-L388](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/pad.ts#L381-L388)）：
+
+```javascript
+const socketReconnecting = () => {
+  pad.collabClient.setStateIdle();        // ① committing=false，中断当前 commit 状态机
+  pad.collabClient.setIsPendingRevision(true); // ② 进入 pending 状态
+  pad.collabClient.setChannelState('RECONNECTING'); // ③ 标记 UI 上的重连提示
+};
+```
+
+`setIsPendingRevision(true)` 的核心作用：在 collab_client 的 `handleUserChanges` 中（[collab_client.ts#L132-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L132-L152)），只有 `!isPendingRevision` 时才允许提交新编辑：
+
+```javascript
+if (!isPendingRevision) {
+  // 可以提交 USER_CHANGES
+  const userChangesData = prepareUserChangeset();
+  if (userChangesData.changeset) { ... sendMessage(stateMessage); ... }
+} else {
+  // pending 期间，本地编辑不发，只是 setTimeout 3s 后再检查
+  setTimeout(handleUserChanges, 3000);
+}
+```
+
+**注意**：pending 期间用户输入不会丢失——编辑器仍然正常打字，只是 changeset 会累积在本地，等 pending 恢复后再一次性提交。
+
+断开时还调用了 `setStateIdle()`，把 `committing = false`、清空 `stateMessage`。这里的语义是：
+- 假设正在进行中的 commit（USER_CHANGES 已发出、尚未收到 ACCEPT_COMMIT）**可能成功也可能失败**（取决于断开时刻消息是否已到达服务端并落库）；
+- 客户端不再等待这条 commit 的回执，而是把决定权交给重连恢复流程——如果该 commit 已落库，重连恢复阶段会通过 CLIENT_RECONNECT 中的 `author === pad.getUserId()` 识别并走 `acceptCommit()`；如果没落库，则该 changeset 仍然保留在本地编辑器的 user changes 中，pending 恢复后会被重新提交。
+
+##### B. 服务端侧：CLIENT_RECONNECT 期间 sessionInfo.rev/time 的维护
+
+[PadMessageHandler.ts#L1197-L1258](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1197-L1258)
+
+重连分支的执行顺序是：
+
+```
+① socket.join(sessionInfo.padId)                            ← 重新进入房间
+② sessionInfo.rev = message.client_rev                     ← 以客户端上报的 rev 为基线
+③ 构建 revisionsNeeded = [client_rev+1, client_rev+2, ..., pad.head]
+④ Promise.all 加载每条 rev 的 changeset/author/timestamp  ← 此时 sessionInfo.rev 不变
+⑤ for (r of revisionsNeeded) { socket.emit(CLIENT_RECONNECT) }
+                                                            ← 逐条发送，但 sessionInfo.rev 仍停留在 client_rev！
+⑥ if (noChanges) { socket.emit(CLIENT_RECONNECT, noChanges:true) }
+```
+
+**关键点：重连分支内部没有递增 `sessionInfo.rev`，也没有设置 `sessionInfo.time`。** 与首次连接分支对比：
+
+| 操作 | 首次连接（else 分支） | 重连恢复（if 分支） |
+|------|----------------------|---------------------|
+| 设置 `sessionInfo.rev` | ✅ 显式赋值 `sessionInfo.rev = headRev` | ⚠️ 只在开头赋值 `client_rev`，**不推进到 headRev** |
+| 设置 `sessionInfo.time` | ✅ 用 `pad.getRevisionDate(headRev)` 或 `Date.now()` 初始化 | ❌ 完全不设置 |
+| 推送缺失 revisions 后更新 rev | ✅ `updatePadClients` while 循环内每推进一条就 `sessioninfo.rev = r` 和 `sessioninfo.time = currentTime` | ❌ 分支内只 `socket.emit` 不落回写 sessionInfo |
+
+**那么 sessionInfo.rev 何时追上 pad.head？**
+
+答案是：**依赖后续的 `updatePadClients(pad)` 调用被动补齐。**
+
+重连分支虽然没有显式调用 `updatePadClients`，但重连的 socket 在步骤 ① 已经 `socket.join(padId)` 进入了房间。只要在本分支执行完成后，房间内任意其他用户提交了一次新的编辑，`handleUserChanges` 末尾必然调用 `updatePadClients(pad)`：
+
+```
+exports.updatePadClients = async (pad) => {
+  ...
+  await Promise.all(roomSockets.map(async (socket) => {
+    const sessioninfo = sessioninfos[socket.id];
+    while (sessioninfo.rev < pad.getHeadRevisionNumber()) {
+      // 逐条推送 NEW_CHANGES
+      ...
+      socket.emit('message', msg);
+      sessioninfo.time = currentTime;   // ★ 补齐 sessionInfo.time
+      sessioninfo.rev = r;              // ★ 逐步推进 sessionInfo.rev 到 head
+    }
+  }));
+};
+```
+
+由于此时 `sessioninfo.rev` 仍停留在 `client_rev`（可能远小于 pad.head），第一次后续的 `updatePadClients` 会把 `CLIENT_RECONNECT` 已经发过的 revisions **再次以 NEW_CHANGES 的形式推给客户端**。这看起来像是重复推送，但客户端有防御：收到 `NEW_CHANGES` 时（[collab_client.ts#L209-L227](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L209-L227)）：
+
+```javascript
+if (newRev !== (rev + 1)) {
+  window.console.warn(`bad message revision on NEW_CHANGES: ${newRev} not ${rev + 1}`);
+  return; // 直接忽略，不报错、不断开
+}
+```
+
+因为客户端的本地 `rev` 已经在处理 CLIENT_RECONNECT 时被推进到了 head，所以这些 NEW_CHANGES 的 `newRev` 不满足 `newRev === rev+1`，会被警告后**安全丢弃**。副作用是：这次被动补齐虽然推送消息是"无效"的，但顺带把服务端的 `sessioninfo.rev` 和 `sessioninfo.time` 同步到了最新值——之后的推送就恢复正常了。
+
+**潜在边界情况**：如果重连后很长时间没人编辑，pad.head 保持不变，那么直到下一次 `updatePadClients` 被触发前，服务端的 `sessionInfo.rev` 和 `sessionInfo.time` 会一直停留在旧值。这不会影响功能，但日志/统计中可能出现不一致。
+
+##### C. 客户端侧：区分自身离线提交 vs 他人远端变更
+
+[collab_client.ts#L242-L267](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L242-L267)
+
+```javascript
+} else if (msg.type === 'CLIENT_RECONNECT') {
+  serverMessageTaskQueue.enqueue(() => {
+    if (msg.noChanges) {
+      setIsPendingRevision(false);
+      return;
+    }
+    const {headRev, newRev, changeset, author = '', apool} = msg;
+    if (newRev !== (rev + 1)) {
+      window.console.warn(`bad message revision on CLIENT_RECONNECT: ...`);
+      return;
+    }
+    rev = newRev;          // 推进本地 rev 号
+    if (author === pad.getUserId()) {
+      // 这是客户端自己离线前提交的编辑（服务端已落库）
+      acceptCommit();
+    } else {
+      // 这是其他用户在客户端离线期间的编辑
+      editor.applyChangesToBase(changeset, author, apool);
+    }
+    if (newRev === headRev) {
+      // 所有 pending revisions 都处理完了
+      setIsPendingRevision(false);
+    }
+  });
+}
+```
+
+**区分逻辑的核心只有一行**：`if (author === pad.getUserId())`。每条 revision 都带有产生它的 authorID，客户端把它与自己的 userId 比较：
+
+- **匹配（自己的编辑）** → 调用 `acceptCommit()`：相当于把它当作一条晚到的 `ACCEPT_COMMIT` 回执，做：
+  - `editor.applyPreparedChangesetToBase()`：把本地"已提交但未确认"的 changeset 正式合入基线
+  - `stateMessage = null`：清空提交中的状态
+  - `committing = false`：解除 commit 锁
+  - `setStateIdle()`：安排 idle 回调
+  - `callbacks.onInternalAction('commitAcceptedByServer')`
+  - `callbacks.onConnectionTrouble('OK')`
+  - `handleUserChanges()`：立刻检查是否有下一批要提交的编辑
+- **不匹配（他人的编辑）** → 调用 `editor.applyChangesToBase(changeset, author, apool)`：像处理普通 NEW_CHANGES 一样，把远程变更合入本地编辑器的基线文本，并显示其他作者的颜色/高亮。
+
+**为什么能这样区分？** 因为服务端保存每条 revision 时都把 authorID 写入了 `revision.meta.author`（`pad.appendRevision(changeset, author)`）。即使客户端断开期间有多个用户同时编辑，每条 revision 的作者归属都是精确可追溯的。
+
+##### D. pending 状态何时恢复正常
+
+`isPendingRevision` 设为 `true` 的触发点有三个（见上一节 A）：
+1. `disconnect` 事件 → `socketReconnecting()`
+2. `reconnect_attempt` → `socketReconnecting()`（兜底：如果第一次重连尝试发生在 disconnect 之前）
+3. `error` 事件
+
+`isPendingRevision` 设回 `false` 的触发点**只有一个**：在 CLIENT_RECONNECT 处理逻辑里：
+
+| 情况 | 触发位置 | 条件 |
+|------|----------|------|
+| 没有缺失 revisions | [collab_client.ts#L246-L249](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L246-L249) | `msg.noChanges === true`（客户端上报的 rev 已经等于 pad.head） |
+| 处理完最后一条缺失 revision | [collab_client.ts#L263-L266](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L263-L266) | `newRev === headRev`（刚处理的这条就是最新 revision） |
+
+**恢复正常后做什么？**
+
+`setIsPendingRevision(false)` 的实现（[collab_client.ts#L451-L461](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L451-L461)）：
+
+```javascript
+const setIsPendingRevision = (value) => {
+  const wasPending = isPendingRevision;
+  isPendingRevision = value;
+  if (wasPending && !value) {
+    handleUserChanges();   // ★ 关键：立即触发一次提交检查
+  }
+};
+```
+
+`wasPending && !value` 这个条件保证只在"**从 true 跳变到 false**"时触发。触发后调用 `handleUserChanges()`，这是因为：
+- 重连期间用户一直在打字，编辑器里已经累积了本地 changeset；
+- pending 期间 `handleUserChanges()` 看到 `isPendingRevision === true` 就什么都不做，只 setTimeout 延期；
+- 现在 pending 解除了，必须**立刻**检查是否有待提交的编辑，否则用户要等下次打字或下次 3 秒定时器到期才能同步。
+
+注意：重连成功时 `socket.io.on('reconnect')` 也会调用 `pad.collabClient.setChannelState('CONNECTED')`（[pad.ts#L373-L379](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/pad.ts#L373-L379)），但此时 `isPendingRevision` 还是 true（CLIENT_RECONNECT 尚未到达），所以 `setChannelState('CONNECTED')` → `setUpSocket()` → `doDeferredActions()` 只会触发 deferred actions，不会解锁用户编辑提交——真正解锁是 `setIsPendingRevision(false)` 的那一步。
+
+##### E. 重连状态机完整时序
+
+```
+  [正常协作]
+    │  用户打字 → handleUserChanges()
+    │  committing=true  →  发送 USER_CHANGES
+    │  等待 ACCEPT_COMMIT  或  接收 NEW_CHANGES
+    │
+    ▼  (网络抖动)
+  socket.io 'disconnect' 事件
+    │
+    ├─► socketReconnecting()
+    │    ├─ setStateIdle()   → committing=false, stateMessage=null
+    │    ├─ setIsPendingRevision(true)
+    │    │   → 后续 handleUserChanges 调用都会 return（只延期不提交）
+    │    └─ setChannelState('RECONNECTING') → UI 显示重连提示
+    │
+    ▼
+  socket.io 自动重连尝试（最多 5 次，1s~5s 退避）
+    │
+    ▼
+  socket.io 'reconnect' 事件
+    │
+    ├─► setChannelState('CONNECTED') → setUpSocket() → doDeferredActions()
+    └─► sendClientReady(true)
+          ├─ msg.reconnect = true
+          ├─ msg.client_rev = collabClient.getCurrentRevisionNumber()  ← 本地 rev 号
+          └─ emit('message', CLIENT_READY)
+                │
+                ▼
+  服务端 handleClientReady reconnect 分支
+    ├─ socket.join(padId)
+    ├─ sessionInfo.rev = client_rev
+    ├─ 加载 [client_rev+1, pad.head] 的所有 revisions
+    └─ 逐条 socket.emit CLIENT_RECONNECT
+          │   每条消息：headRev, newRev, changeset, apool, author, timestamp
+          │
+          ▼
+  客户端 handleMessageFromServer → CLIENT_RECONNECT 分支
+    │
+    ├─ serverMessageTaskQueue.enqueue()  ← 保证串行处理
+    │
+    ▼  处理每条 CLIENT_RECONNECT（按 newRev 递增顺序）：
+    │
+    │  newRev !== rev+1 ? → warn 后 return 丢
+    │  rev = newRev
+    │  author === userId ?
+    │    ├─ 是 → acceptCommit()        // 自己已落库的编辑
+    │    │        └─ committing=false, stateMessage=null
+    │    └─ 否 → applyChangesToBase()  // 他人编辑，合入本地基线
+    │
+    │  newRev === headRev ?
+    │    └─ 是 → setIsPendingRevision(false)
+    │              └─ handleUserChanges()  // ★ 立即提交 pending 期间的本地编辑
+    │
+    ▼
+  恢复正常协作状态
+```
+
+---
+
+#### 2.3.6 重连后首次编辑的"客户端-服务端状态不一致"与断言冲突
+
+上一节描述了正常的重连恢复流程。但这一节揭示一个隐藏的**竞态条件/一致性问题**：客户端已经恢复了提交能力，但服务端的 `sessionInfo.rev` 和 `sessionInfo.time` 可能还停留在旧值，这与 `handleUserChanges` 中的关键断言之间存在冲突。
+
+##### A. 问题根源：客户端状态前进一步，服务端状态原地踏步
+
+重连恢复流程结束后：
+
+| 状态变量 | 客户端 | 服务端 |
+|----------|--------|--------|
+| `rev` | 已推进到 `pad.head`（处理 CLIENT_RECONNECT 时逐条 `rev = newRev`） | **停留在 `client_rev`**（只在 reconnect 分支开头赋值一次 `sessionInfo.rev = message.client_rev`，发送 CLIENT_RECONNECT 时不更新） |
+| `time`（时间戳基线） | 客户端本地无需维护这个变量（每条消息自带时间戳） | **未初始化**（重连分支完全没碰 `sessionInfo.time`） |
+| 提交能力 | ✅ 可以提交（`isPendingRevision = false`，`committing = false`） | —— |
+| 接收广播能力 | ✅ 已 join 房间，可以接收 NEW_CHANGES | —— |
+
+**客户端为何能提交**：
+- `setIsPendingRevision(false)` 解锁了 `handleUserChanges()` 的提交闸门（[collab_client.ts#L132-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/static/js/collab_client.ts#L132-L152)）
+- `committing = false`，没有正在进行的 commit 占用通道
+- 客户端本地 `rev` 已经是最新值，可以构造正确的 `baseRev`
+
+**服务端 `sessionInfo.rev` 为何没前进**：
+- 重连分支（[PadMessageHandler.ts#L1197-L1258](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1197-L1258)）内部只有一次 `sessionInfo.rev = message.client_rev` 赋值
+- 发送 CLIENT_RECONNECT 时，只 `socket.emit` 消息，**完全不更新 `sessionInfo.rev`**
+- 重连分支既不调用 `updatePadClients(pad)`，也不在末尾手动同步 `sessionInfo.rev = pad.head`
+
+对比首次连接分支的做法（[PadMessageHandler.ts#L1396-L1413](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1396-L1413)）：
+```typescript
+sessionInfo.rev = headRev;                   // ✅ 立即同步到最新
+sessionInfo.time = await pad.getRevisionDate(headRev);  // ✅ 初始化时间戳
+await exports.updatePadClients(pad);         // ✅ 还调用 updatePadClients 补发
+```
+
+重连分支相当于"只做了一半"——把消息推给客户端了，但服务端自己的状态没更新。
+
+##### B. 关键断言：`assert.equal(thisSession.rev, r)`
+
+在 `handleUserChanges` 函数中（[PadMessageHandler.ts#L976-L978](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L976-L978)）：
+
+```typescript
+// The client assumes that ACCEPT_COMMIT and NEW_CHANGES messages arrive in order. Make sure we
+// have already sent any previous ACCEPT_COMMIT and NEW_CHANGES messages.
+assert.equal(thisSession.rev, r);
+```
+
+这个断言的语义：**服务端记录的"该客户端已确认收到的 revision"必须等于 rebase 完成后到达的 revision 号**。
+
+变量含义：
+- `thisSession.rev`：服务端认为客户端已同步到的 revision
+- `r`：从客户端上报的 `baseRev` 开始，经过 while 循环逐个 follow 追上 `pad.head` 后最终到达的 revision 号
+
+断言的目的是确保消息顺序性——在给这个客户端发 `ACCEPT_COMMIT(newRev)` 之前，所有该客户端应该收到的 `NEW_CHANGES` 都已经发过了，且 `thisSession.rev` 正确反映了客户端的同步状态。
+
+##### C. 冲突场景：客户端可提交 + 服务端 rev 旧值 = 断言失败
+
+重现步骤（精确时序）：
+
+```
+时间轴：
+
+T0  客户端正常协作，本地 rev = N，提交一条 USER_CHANGES（baseRev=N）
+T1  网络断开，客户端没收到 ACCEPT_COMMIT
+    socket.on('disconnect') → socketReconnecting()
+      → setStateIdle()       // committing=false, stateMessage=null
+      → setIsPendingRevision(true)
+      → setChannelState('RECONNECTING')
+T2  服务端收到并落库该提交，pad.head = N+1
+    向房间广播 NEW_CHANGES(N+1)，但客户端已断线收不到
+T3  另一客户端提交编辑，pad.head = N+2
+    广播 NEW_CHANGES(N+2)，客户端也收不到
+T4  socket.io 自动重连成功
+    socket.io.on('reconnect') → sendClientReady(true)
+      msg.reconnect = true
+      msg.client_rev = getCurrentRevisionNumber() = N  (客户端本地 rev 还在 N)
+T5  服务端 handleClientReady reconnect 分支:
+      socket.join(padId)
+      sessionInfo.rev = client_rev = N   ← ★ 只赋值一次
+      加载 revisionsNeeded = [N+1, N+2]
+      逐条发送 CLIENT_RECONNECT:
+        CLIENT_RECONNECT(N+1, author=该客户端)
+        CLIENT_RECONNECT(N+2, author=另一客户端)
+      (发送过程中 sessionInfo.rev 仍为 N，不更新)
+T6  客户端处理 CLIENT_RECONNECT:
+      处理 N+1: author === userId → acceptCommit() → rev = N+1
+      处理 N+2: author !== userId → applyChangesToBase() → rev = N+2
+      newRev === headRev → setIsPendingRevision(false)
+        → wasPending && !value → handleUserChanges()  ★ 立即触发提交
+T7  客户端构造新的 USER_CHANGES，baseRev = N+2（本地最新 rev）
+    emit('message', USER_CHANGES)
+T8  服务端 handleUserChanges 处理该消息:
+      const thisSession = sessioninfos[socket.id]
+      const {baseRev=N+2, apool, changeset} = message
+      ... 各种校验通过 ...
+      let r = baseRev = N+2
+      while (r < pad.head) {   // 假设 pad.head 仍为 N+2
+        // 循环体不执行
+      }
+      const newRev = await pad.appendRevision(rebasedChangeset, author)
+      assert.equal(thisSession.rev, r)  ← ★ assert N === N+2
+                                          ← 💥 ASSERTION FAILED!
+```
+
+**断言失败触发的后果**（[PadMessageHandler.ts#L987-L991](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L987-L991)）：
+```typescript
+catch (err:any) {
+  socket.emit('message', {disconnect: 'badChangeset'});
+  stats.meter('failedChangesets').mark();
+  messageLogger.warn(`Failed to apply USER_CHANGES from author ...`);
+}
+```
+客户端被强制断开，显示"badChangeset"，但它的 changeset 其实是完全合法的——问题出在服务端状态不一致，而非客户端数据有误。
+
+##### D. 何时能侥幸通过？
+
+只有一种情况断言不会失败：**在 T6 和 T7 之间，有另一个客户端提交了编辑**，触发 `updatePadClients(pad)`：
+
+```
+T6.5  另一客户端提交编辑 → handleUserChanges → updatePadClients(pad)
+        遍历 roomSockets，包括刚重连的 socket:
+          sessioninfo = sessioninfos[socket.id]  // rev = N
+          while (N < pad.head) {  // pad.head 现在可能是 N+3
+            推送 NEW_CHANGES(N+1) → client 端 newRev !== rev+1 → warn 后丢弃
+            sessioninfo.time = timestamp_N+1
+            sessioninfo.rev = N+1
+            推送 NEW_CHANGES(N+2) → 同样被丢弃
+            sessioninfo.time = timestamp_N+2
+            sessioninfo.rev = N+2
+            推送 NEW_CHANGES(N+3) → 正常接收
+            sessioninfo.time = timestamp_N+3
+            sessioninfo.rev = N+3
+          }
+T7    原客户端提交 USER_CHANGES(baseRev=N+2)
+        ...
+        assert.equal(thisSession.rev, r)  // assert N+3 === N+3 → ✅ PASS
+```
+
+虽然断言通过了，但中间推送的 N+1、N+2 两条 NEW_CHANGES 对客户端来说是重复消息，被 `newRev !== rev+1` 检查丢弃——这是必要的防御性编程，但也暴露了服务端状态不同步的问题。
+
+##### E. 与重传检查的交互
+
+还有一个更隐蔽的交互：`handleUserChanges` 中的**重传检测**（[PadMessageHandler.ts#L931-L934](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L931-L934)）：
+
+```typescript
+if (canonicalCs === c && thisSession.author === authorId) {
+  // Assume this is a retransmission of an already applied changeset.
+  rebasedChangeset = identity(unpack(canonicalCs).oldLen);
+}
+```
+
+如果客户端在断线前提交的那条编辑（T0 时刻）没收到 ACCEPT_COMMIT，断线期间服务端已经落库了，重连后客户端可能因为本地 editor 状态还保留着那个 changeset 而重传。此时：
+
+- 客户端 `baseRev = N`（断线前的 rev）
+- `canonicalCs` 与 revision N+1 的 changeset 完全匹配，`authorId` 也匹配
+- 被判定为重传，`rebasedChangeset = identity(...)`（无净变化的空 changeset）
+- while 循环还会继续推进 r 到 pad.head（例如 N+2）
+- 最终 `assert.equal(thisSession.rev, r)` → `assert N === N+2` → **仍然失败！**
+
+重传检测只是把 changeset 变成了空操作，但没有更新 `thisSession.rev`，所以断言还是失败。这意味着即使客户端只是"重新提交一个已经落库的编辑"，也会被断言错误地判定为 `badChangeset` 而踢下线。
+
+##### F. sessionInfo.time 的连锁问题
+
+`sessionInfo.time` 在重连分支中完全未初始化。在 `updatePadClients` 中（[PadMessageHandler.ts#L1041](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1041)）：
+
+```typescript
+timeDelta: currentTime - sessioninfo.time,
+```
+
+- 如果 `sessioninfo.time` 是 `undefined`，`timeDelta = NaN`
+- 客户端收到 `timeDelta=NaN` 会导致广播和时间轴的时间显示异常
+- 但推送第一条 NEW_CHANGES 后，`sessioninfo.time = currentTime` 会被赋值，后续就正常了
+
+而在 `handleUserChanges` 中（[PadMessageHandler.ts#L985](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L985)）：
+
+```typescript
+if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
+```
+
+- 如果断言能通过（侥幸场景），`thisSession.time` 会被正确设置
+- 如果断言失败，这个赋值永远执行不到
+
+##### G. 问题总结
+
+这是 Etherpad 代码中一个真实存在的一致性缺陷，根因在于：
+
+1. **重连分支只同步客户端，不同步服务端自己的状态**——CLIENT_RECONNECT 发出去了，但 `sessionInfo.rev` 和 `sessionInfo.time` 没更新
+2. **断言假设服务端状态始终与客户端同步**——`assert.equal(thisSession.rev, r)` 隐含假设 `sessionInfo.rev` 正确反映了客户端的同步进度
+3. **两条路径实现不对称**——首次连接分支显式设置了 `sessionInfo.rev` 和 `sessionInfo.time`，还调用 `updatePadClients`，但重连分支全都省了
+
+正确的修复应该是在重连分支末尾（发送完所有 CLIENT_RECONNECT 之后）同步服务端状态：
+
+```typescript
+// 重连分支末尾应补充：
+sessionInfo.rev = pad.getHeadRevisionNumber();
+sessionInfo.time = await pad.getRevisionDate(pad.getHeadRevisionNumber());
+```
+
+但目前代码里没有这两行，导致了本节描述的竞态条件。
+
 ### 2.4 重复作者检测（Stale Tab 踢下线）
 
 [PadMessageHandler.ts#L1169-L1186](file:///d:/fz/0601-1/solo-dogfeeding/code/3-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1169-L1186)
