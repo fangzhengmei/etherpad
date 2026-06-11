@@ -28,7 +28,9 @@ Etherpad 同时注册了两套互相独立的对外 HTTP API，它们在 Express
 
 挂载位置：[expressCreateServer 钩子](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/handler/RestAPI.ts#L335-L1551)
 
-**挂载阶段**：在 express-session 和 webaccess.checkAccess 之后（理论上会经过会话中间件，但实际 API 校验在 handler 内部，不使用 session）。
+**挂载阶段**：在 express-session **和 webaccess.checkAccess 之后**。这意味着请求到达 `/api/2/*` 之前，会先完整跑完 [webaccess.ts 的 checkAccess](file:///d:/fz/0601-1/solo-dogfeeding/code/6-etherpad-lite/src/node/hooks/express/webaccess.ts#L59-L231)（包括 `requireAuthentication` 开关、HTTP Basic Auth、`authenticate`/`authorize` 钩子、`preAuthorize` 插件等）。默认配置 `requireAuthentication=false` 时这层不拦截，但一旦开启鉴权，调用方会碰到下面第六节描述的前置拦截问题。
+
+**注意**：新版 API 的鉴权（API Key / JWT）在 APIHandler.handle() 内部，和 webaccess 的会话鉴权是**两套完全独立**的校验机制，会先后发生。
 
 **路由生成策略**：单一的 `/api/2` 前缀，内部由一个手写的 `Map<HTTP_METHOD, { path → {apiVersion, functionName} }>` 做分发，覆盖所有历史版本中需要暴露的函数：
 
