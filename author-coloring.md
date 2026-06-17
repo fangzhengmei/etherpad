@@ -133,23 +133,259 @@ const mapAuthorWithDBKey = async (mapperkey: string, mapper: string) => {
 - `token2author:${token}` → `authorID` （浏览器 token 映射）
 - `mapper2author:${mapper}` → `authorID` （外部系统映射）
 
+### 3.3 getAuthorId 钩子扩展点
+
+[AuthorManager.ts:161-166](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts#L161-L166) 提供了 `getAuthorId` 钩子，允许插件覆盖作者身份解析逻辑：
+
+```typescript
+exports.getAuthorId = async (token: string, user: object) => {
+  const context = {dbKey: token, token, user};
+  let [authorId] = await hooks.aCallFirst('getAuthorId', context);
+  if (!authorId) authorId = await getAuthor4Token(context.dbKey);
+  return authorId;
+};
+```
+
+**设计意图**：
+- 支持 SSO/OAuth 场景：插件可根据 `req.session.user` 中的身份信息映射到固定 authorID
+- 默认回退：若钩子未返回，则走 `token2author` 标准映射
+
 ---
 
-## 4. 会话生命周期 (Session Lifecycle)
+## 4. 多作者颜色归属访问校验链路 (Access Validation Chain)
 
-### 4.1 会话创建
+本节描述 Etherpad 如何通过 **HTTP 会话层（express-session）**、**浏览器 token（HttpOnly Cookie）**、**作者身份（authorID）** 三层递进校验，最终确定颜色归属所对应的 authorID。
+
+### 4.1 Token 的生成与 HTTP Cookie 下发
+
+浏览器首次访问 Pad 前，由 [ensureAuthorTokenCookie.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/utils/ensureAuthorTokenCookie.ts) 确保存在作者 token：
+
+```typescript
+export const ensureAuthorTokenCookie = (req, res, settings) => {
+  const prefix = settings.cookie?.prefix || '';
+  const cookieName = `${prefix}token`;
+  const existing = req.cookies?.[cookieName];
+
+  // 已有合法 token → 直接复用（保证跨请求、跨 Pad 颜色一致）
+  if (typeof existing === 'string' && padutils.isValidAuthorToken(existing)) {
+    return existing;
+  }
+
+  // 否则生成新 token: t.<base64url字符串>
+  const token = padutils.generateAuthorToken();
+  res.cookie(cookieName, token, {
+    httpOnly: true,        // 禁止 JS 读取，防止 XSS 窃取
+    secure: Boolean(req.secure),
+    sameSite: isCrossSiteEmbed(req) ? 'none' : 'lax',
+    maxAge: 60 * 24 * 60 * 60 * 1000,  // 60 天 —— 颜色身份可长期保持
+    path: '/',
+  });
+  return token;
+};
+```
+
+**Token 格式校验** ([pad_utils.ts:393-404](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/pad_utils.ts#L393-L404))：
+
+```typescript
+isValidAuthorToken = (t) => {
+  if (typeof t !== 'string' || !t.startsWith('t.')) return false;
+  const v = t.slice(2);
+  return v.length > 0 && base64url.test(v);
+};
+
+generateAuthorToken = () => `t.${randomString()}`
+```
+
+**关键安全设计**：
+- `httpOnly: true` → 前端 JS 无法读取 token，Socket.IO 握手时浏览器自动带 Cookie
+- 60 天 maxAge → 同一浏览器长期保留同一颜色身份
+- `t.` 前缀 + base64url 校验 → 防止构造恶意键名访问数据库
+
+### 4.2 HTTP 层访问控制 (webaccess)
+
+在 [webaccess.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/hooks/express/webaccess.ts) 中，`checkAccess` 中间件执行 4 步检查：
+
+```
+Step 1: preAuthorize 钩子
+    ├─ 插件可提前放行或拒绝（/admin 禁止插件放行）
+    └─ 任一钩子显式处理 → 跳过后续步骤
+
+Step 2: 首次授权检查 authorize()
+    ├─ 管理员 → create
+    ├─ 无需认证 → create
+    ├─ 未认证 → deny
+    └─ 需授权 → authorize 钩子判断等级
+
+Step 3: 认证 (authenticate)
+    ├─ 插件 authenticate 钩子
+    └─ Fallback: HTTP Basic Auth（settings.users）
+        └─ 成功后把 user 对象存入 req.session.user
+
+Step 4: 二次授权检查 authorize()
+    └─ 通过则 next()，否则 403
+```
+
+**与颜色归属的关系**：
+- `webaccess.checkAccess` 仅解决"能不能访问"，不决定 authorID
+- 但它把 `req.session.user.padAuthorizations[padId]` 写入，为后续 SecurityManager 提供授权级别
+- 认证通过不意味着颜色身份确定——颜色归属由 SecurityManager 在 Socket 层通过 token/sessionCookie 决定
+
+### 4.3 Socket 层安全访问校验 (SecurityManager)
+
+[SecurityManager.checkAccess](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SecurityManager.ts#L60-L150) 是**颜色归属的最终裁决者**，决定了 `handleClientReady` 将用哪个 authorID 读取/写入 `colorId`。
+
+完整校验流程：
+
+```typescript
+exports.checkAccess = async (padID, sessionCookie, token, userSettings) => {
+  // ── 校验 1: padID 合法性 ──
+  if (!padID) return DENY;
+
+  // 只读 ID 转换为真实 padID
+  if (readOnlyManager.isReadOnlyId(padID)) {
+    canCreate = false;
+    padID = await readOnlyManager.getPadId(padID);
+    if (padID == null) return DENY;
+  }
+
+  // ── 校验 2: HTTP 认证/授权 ──
+  if (settings.requireAuthentication) {
+    if (userSettings == null) return DENY;
+    if (userSettings.readOnly) canCreate = false;
+    const level = webaccess.normalizeAuthzLevel(
+        userSettings.padAuthorizations?.[padID]);
+    if (!level) return DENY;
+    if (level !== 'create') canCreate = false;
+  }
+
+  // ── 校验 3: 插件 onAccessCheck 钩子 ──
+  if (hooks.callAll('onAccessCheck', ...).some(isFalse)) return DENY;
+
+  // ── 校验 4: HTTP API 会话 (sessionCookie) ──
+  const sessionAuthorID = await sessionManager.findAuthorID(
+      padID.split('$')[0], sessionCookie);
+
+  // requireSession=true: 必须通过 HTTP API 创建了有效会话
+  if (settings.requireSession && !sessionAuthorID) return DENY;
+
+  // ── 校验 5: 浏览器 author token ──
+  if (!sessionAuthorID && token != null &&
+      !padutils.isValidAuthorToken(token)) {
+    return DENY;
+  }
+
+  // ── 裁决: 决定颜色归属的 authorID ──
+  // 优先级: HTTP API 会话 > getAuthorId 插件钩子 > 浏览器 token
+  const grant = {
+    accessStatus: 'grant',
+    authorID: sessionAuthorID ||
+              await authorManager.getAuthorId(token, userSettings),
+  };
+
+  // ── 校验 6: 群组 Pad 额外规则 ──
+  if (padID.includes('$')) {
+    if (!padExists && sessionAuthorID == null) return DENY;     // 创建群组 pad 必须有 session
+    if (padExists && !pad.getPublicStatus() &&
+        sessionAuthorID == null) return DENY;                  // 访问私有群组 pad 必须有 session
+  }
+
+  return grant;
+};
+```
+
+### 4.4 颜色归属决策优先级
+
+从上述代码中提炼出 authorID（颜色归属）的优先级：
+
+| 优先级 | 来源 | 触发条件 | 颜色归属的稳定性 |
+|------|------|---------|-------------|
+| 1 | **HTTP API sessionCookie** | 调用 `createSession` API，且 `sessionCookie` 中的会话未过期且匹配群组 | ✅ 极高：会话期间固定 authorID，跨设备同账号可共享 |
+| 2 | **`getAuthorId` 钩子** | SSO 插件根据 `userSettings` 返回 authorID | ✅ 高：插件可实现 SSO → 固定 authorID 映射 |
+| 3 | **浏览器 token（HttpOnly Cookie）** | 无 session 且无钩子，最常见的 Web UI 场景 | ✅ 中高：同一浏览器 60 天内固定，清除 Cookie 则换身份/换颜色 |
+
+### 4.5 访问校验失败对颜色归属的影响
+
+| 失败点 | 原因 | 对颜色归属的影响 |
+|-------|------|---------------|
+| padID 缺失或无效 | 请求格式错误 | 直接拒绝，无颜色归属 |
+| requireAuthentication + 未登录 | webaccess 未通过 | 401 拒绝，用户需先登录再建立 Socket 连接 |
+| requireSession + 无有效 session | HTTP API 未创建会话 | 拒绝，必须通过 API 先拿 sessionCookie |
+| token 格式非法 | 被篡改/伪造的 token | 拒绝，防止攻击者构造 `token2author:` 任意键访问 |
+| 创建/访问私有群组 pad 无 session | 未通过 HTTP API 进群 | 拒绝，群组 pad 颜色归属只能来自 API 会话 |
+
+### 4.6 颜色归属链路完整时序图
+
+```
+浏览器                          Node.js (Express + Socket.IO)
+  │                                  │
+  │ GET /p/abc                       │
+  │────────────────────────────────▶ │
+  │                                  │ ensureAuthorTokenCookie()
+  │                                  │   ├─ 检查 token cookie 是否合法
+  │                                  │   └─ 不合法 → Set-Cookie: token=t.xxx (60天)
+  │                                  │
+  │                                  │ webaccess.checkAccess()
+  │                                  │   ├─ preAuthorize 钩子
+  │                                  │   ├─ 授权检查
+  │                                  │   ├─ 必要时 HTTP Basic 认证 → req.session.user
+  │                                  │   └─ 二次授权检查 → next()
+  │◀──────────────────────────────── │
+  │                                  │
+  │ socket.emit(CLIENT_READY)        │
+  │   auth:{sessionCookie,token}     │
+  │   userInfo:{colorId,name}        │
+  │────────────────────────────────▶ │
+  │                                  │
+  │                                  │ SecurityManager.checkAccess()
+  │                                  │   ├─ sessionAuthorID = findAuthorID(group, sessionCookie)
+  │                                  │   ├─ requireSession? 无则 DENY
+  │                                  │   ├─ token 格式校验
+  │                                  │   └─ authorID = sessionAuthorID
+  │                                  │                  || hooks.getAuthorId()
+  │                                  │                  || getAuthor4Token(token)
+  │                                  │
+  │                                  │ AuthorManager.getAuthor(authorID)
+  │                                  │   └─ 读取 colorId / name
+  │                                  │
+  │                                  │ (可选) setAuthorColorId / setAuthorName
+  │                                  │   └─ 应用客户端带来的初始颜色/昵称
+  │                                  │
+  │ CLIENT_VARS                      │
+  │   colorPalette: [64色]           │
+  │   userColor: colorId             │◀ 颜色归属的最终值
+  │   userId: authorID               │
+  │   historicalAuthorData: {...}    │
+  │◀──────────────────────────────── │
+  │                                  │
+  │ 广播 USER_NEWINFO(authorID,colorId) │
+  │────────────────────────────────▶ │──────────▶ 其他客户端更新颜色显示
+```
+
+---
+
+## 5. 会话生命周期 (Session Lifecycle)
+
+### 5.1 会话创建与反向索引建立
 
 会话管理位于 [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L105-L159)，通过 API 创建的会话将作者与群组绑定：
 
 ```typescript
 exports.createSession = async (groupID: string, authorID: string, validUntil: number) => {
+  // validUntil 必须是未来的时间戳（秒级）
+  if (validUntil < Math.floor(Date.now() / 1000)) {
+    throw new CustomError('validUntil is in the past', 'apierror');
+  }
+
   const sessionID = `s.${randomString(16)}`;
 
+  // 1. 写入会话主记录
   await db.set(`session:${sessionID}`, {groupID, authorID, validUntil});
 
-  // 建立反向索引
+  // 2. 建立双向反向索引
   await Promise.all([
+    // group → sessions：用于遍历组内所有会话、组删除时清理
     db.setSub(`group2sessions:${groupID}`, ['sessionIDs', sessionID], 1),
+    // author → sessions：用于遍历作者所有会话、作者清理时回收
     db.setSub(`author2sessions:${authorID}`, ['sessionIDs', sessionID], 1),
   ]);
 
@@ -157,7 +393,14 @@ exports.createSession = async (groupID: string, authorID: string, validUntil: nu
 };
 ```
 
-### 4.2 会话查找与验证
+**数据库记录全景**：
+| 数据库键 | 结构 | 用途 |
+|---------|------|------|
+| `session:${sid}` | `{groupID, authorID, validUntil}` | 会话主数据，过期判断依据 |
+| `group2sessions:${gid}` | `{sessionIDs: {[sid]: 1}}` | 群组 → 会话 反向索引 |
+| `author2sessions:${aid}` | `{sessionIDs: {[sid]: 1}}` | 作者 → 会话 反向索引 |
+
+### 5.2 会话查找与过期验证
 
 [findAuthorID](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L39-L85) 用于从 cookie 中解析有效会话对应的作者：
 
@@ -174,9 +417,156 @@ exports.findAuthorID = async (groupID: string, sessionCookie: string) => {
 };
 ```
 
-### 4.3 连接会话信息 (sessioninfos)
+**过期判断核心**：`now < validUntil`（Unix 秒级时间戳对比）。
 
-在 [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L102-L103) 中，每个 socket 连接维护会话信息：
+**注意**：`findAuthorID` 在会话过期时**静默忽略**（不报错，返回 undefined），交给 SecurityManager 决定是否降级使用 token。
+
+### 5.3 会话过期对颜色归属的影响
+
+| 场景 | 会话状态 | 颜色归属 authorID | 用户可见行为 |
+|-----|---------|----------------|-----------|
+| **requireSession=false**（默认） | 会话过期 | ✅ 自动降级使用浏览器 token 对应的 authorID | 颜色可能切换（若 session.author ≠ token.author），提示重新登录 |
+| **requireSession=true**（严格） | 会话过期 | ❌ SecurityManager.checkAccess 返回 DENY | Socket 连接被拒绝，需重新调用 createSession API |
+| 群组 pad 私有 + 无有效会话 | 会话过期 | ❌ DENY | 无法访问该 pad |
+| 多个 sessionID 中只有一个有效 | 部分过期 | ✅ 使用第一个未过期且匹配群组的会话 | 颜色归属不变（只要会话的 authorID 相同） |
+
+### 5.4 会话删除与反向索引回收
+
+[deleteSession](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L184-L206) 是会话清理的唯一入口，必须**先回收反向索引再删除主记录**以保持一致性：
+
+```typescript
+exports.deleteSession = async (sessionID) => {
+  // 读取会话信息获取 groupID/authorID（必须先读）
+  const session = await db.get(`session:${sessionID}`);
+  if (session == null) throw new CustomError('sessionID does not exist', 'apierror');
+
+  const {groupID, authorID} = session;
+
+  // 第一步：从双向反向索引中移除 sessionID
+  //   使用 setSub(undefined) 而非 db.remove
+  //   因为 UeberDB 会在 JSON.stringify 时忽略 undefined 属性
+  await Promise.all([
+    db.setSub(`group2sessions:${groupID}`,
+              ['sessionIDs', sessionID], undefined),
+    db.setSub(`author2sessions:${authorID}`,
+              ['sessionIDs', sessionID], undefined),
+  ]);
+
+  // 第二步：删除会话主记录（最后操作，保证一致性）
+  await db.remove(`session:${sessionID}`);
+};
+```
+
+**一致性保障要点**：
+- 写入顺序：先建索引后建主记录 → 删除顺序：先删索引后删主记录
+- UeberDB 的 `setSub(path, undefined)` 是原子操作：读 → 修改属性 → 写回
+- 索引对象中的值设为 `1`（仅表示存在），删除时设 `undefined`
+
+### 5.5 反向索引回收的级联场景
+
+#### 场景 A：删除群组时级联清理所有会话
+
+[GroupManager.deleteGroup](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/GroupManager.ts#L46-L81)：
+
+```typescript
+exports.deleteGroup = async (groupID) => {
+  const group = await db.get(`group:${groupID}`);
+
+  // 1. 先删除该群组的所有 Pad
+  await Promise.all(Object.keys(group.pads).map(padId => ...));
+
+  // 2. 级联删除所有会话
+  //    注意 Issue #5798：undefined 的 sessionID 键仍存在于对象中，
+  //    必须 filter 掉才不会 deleteSession 抛错
+  const {sessionIDs = {}} = await db.get(`group2sessions:${groupID}`) || {};
+  await Promise.all(
+      Object.keys(sessionIDs)
+            .filter(id => sessionIDs[id])  // 过滤已被 setSub(undefined) 标记删除的
+            .map(sessionId => sessionManager.deleteSession(sessionId))
+  );
+
+  // 3. 清理群组记录与映射
+  await Promise.all([
+    db.remove(`group2sessions:${groupID}`),
+    db.setSub('groups', [groupID], undefined),
+    ...Object.keys(group.mappings || {})
+            .map(m => db.remove(`mapper2group:${m}`)),
+  ]);
+
+  await db.remove(`group:${groupID}`);
+};
+```
+
+**对颜色归属的影响**：群组删除意味着其中所有会话的 authorID 不再优先于 token，Web UI 用户会回退到浏览器 token 的颜色身份。
+
+#### 场景 B：作者被删除（GDPR 匿名化）时的会话回收
+
+目前 Etherpad 核心并未提供 `deleteAuthor` API，但作者匿名化（GDPR 功能）会保留 authorID 并将颜色/名称清空：
+- 已建立的会话**继续有效**（`session:${sid}` 中引用的 authorID 仍存在）
+- 颜色会变为默认（若 name/colorId 被清空），用户再次进入 pad 时 `handleClientReady` 读到空 colorId → 客户端重新分配
+- `author2sessions:${aid}` 索引仅用于 `listSessionsOfAuthor` API 查询，不会自动清理
+
+#### 场景 C：listSessionsWithDBKey 中的僵尸会话
+
+反向索引中残留已删除的会话（setSub undefined 留下的键）时，[listSessionsWithDBKey](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L246-L263) 会尝试逐个读取：
+
+```typescript
+const listSessionsWithDBKey = async (dbkey) => {
+  const sessionObject = await db.get(dbkey);
+  const sessions = sessionObject ? sessionObject.sessionIDs : null;
+
+  for (const sessionID of Object.keys(sessions || {})) {
+    try {
+      // 若会话主记录已删除，getSessionInfo 抛错 → 静默 catch
+      sessions[sessionID] = await exports.getSessionInfo(sessionID);
+    } catch (err: any) {
+      if (err.message === 'sessionID does not exist') {
+        // 残留索引：catch 后此键会保留原来的 1 值（非会话信息）
+        // 返回的对象中会混合出现 {sid1: {sessionInfo}, sid2: 1}
+        console.debug(`no session exists with ID ${sessionID}`);
+      } else {
+        throw err;
+      }
+    }
+  }
+  return sessions;
+};
+```
+
+**潜在问题（僵尸索引）**：
+- 若主记录已删但反向索引键还在，`listSessionsOfGroup` 返回值中会混入 `1` 值
+- Issue #5798 的修复：在 deleteGroup 中 `.filter(id => sessionIDs[id])` 规避
+- 但日常运行中的孤立索引暂无后台 GC 机制
+
+### 5.6 会话过期的被动清理与主动清理
+
+#### 被动清理（当前实现）
+
+**没有定时删除过期 `session:` 记录的后台任务！**
+
+过期会话的处理完全是**查询时判断**：
+- `findAuthorID(group, sessionCookie)`：`now < validUntil` 时才使用
+- `getSessionInfo(sessionID)`：**不会**主动校验 `validUntil`，API 可查询到已过期会话
+- `listSessionsOfGroup/Author`：返回列表包含过期会话，由 API 调用方自行判断
+
+#### 主动清理策略（需要额外实现）
+
+当前版本需管理员通过脚本调用 `deleteSession` 清理，可基于：
+1. `listSessionsOfGroup(groupID)` 遍历 → 检查 `validUntil` → 过期则 `deleteSession`
+2. 按 `author2sessions:*` 范围扫描数据库（视底层存储能力）
+
+#### 会话过期长期积压对颜色归属的风险
+
+| 风险 | 说明 |
+|-----|------|
+| **authorID 永久绑定** | 过期 session 的 authorID 仍存在于 `session:` 记录中，GDPR 场景下无法证明已删除 |
+| **性能影响** | `findAuthorID` 每连接要遍历 cookie 中的所有 sessionID 并行查库，过期记录越多无效查询越多 |
+| **反向索引膨胀** | `group2sessions:` 对象持续增长，`setSub` 的读改写成本上升 |
+| **颜色归属混淆** | 若管理员误将 `validUntil` 设得极长（999999999999），即使用户退出登录也会一直使用旧 authorID |
+
+### 5.7 连接级会话信息 (sessioninfos)
+
+在 [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L102-L103) 中，每个 socket 连接在内存中维护会话信息：
 
 ```typescript
 const sessioninfos = {
@@ -193,11 +583,17 @@ const sessioninfos = {
 };
 ```
 
+**关键性能优化**：
+- `sessioninfos[socket.id].author` 是连接建立时的**内存快照**
+- 后续 `USER_CHANGES` 变更校验直接使用内存中的 `thisSession.author`，不再每次查库
+- **连接期间不重新校验会话是否过期**：只要 Socket 不断开，即使 `session.validUntil` 已到，颜色归属仍保持连接初始时的 authorID
+- 断连后重连：触发新一轮 SecurityManager.checkAccess，此时才会检测到会话过期并降级
+
 ---
 
-## 5. 客户端初始化流程 (Client Initialization)
+## 6. 客户端初始化流程 (Client Initialization)
 
-### 5.1 CLIENT_READY 消息处理
+### 6.1 CLIENT_READY 消息处理
 
 用户连接后发送 `CLIENT_READY` 消息，服务器在 [handleClientReady](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1118-L1458) 中进行处理：
 
@@ -259,7 +655,7 @@ const handleClientReady = async (socket, message) => {
 };
 ```
 
-### 5.2 客户端协作客户端初始化
+### 6.2 客户端协作客户端初始化
 
 客户端收到 `CLIENT_VARS` 后，在 [collab_client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/collab_client.ts#L39-L529) 中初始化协作客户端：
 
@@ -299,9 +695,9 @@ const getCollabClient = (ace2editor, serverVars, initialUserInfo, options, _pad)
 
 ---
 
-## 6. 实时颜色同步 (Real-time Color Sync)
+## 7. 实时颜色同步 (Real-time Color Sync)
 
-### 6.1 用户信息更新流程
+### 7.1 用户信息更新流程
 
 当用户修改颜色或名称时，触发以下流程：
 
@@ -376,7 +772,7 @@ const handleUserInfoUpdate = async (socket, {data: {userInfo: {name, colorId}}})
 }
 ```
 
-### 6.2 用户离开处理
+### 7.2 用户离开处理
 
 当用户断开连接时，在 [handleDisconnect](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L246-L287) 中处理：
 
@@ -419,9 +815,9 @@ exports.handleDisconnect = async (socket) => {
 
 ---
 
-## 7. 文本作者属性标记 (Author Attribution on Text)
+## 8. 文本作者属性标记 (Author Attribution on Text)
 
-### 7.1 插入时的作者标记
+### 8.1 插入时的作者标记
 
 在 [stampAuthorOnInserts.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/stampAuthorOnInserts.ts) 中，确保每个插入操作都带有作者属性：
 
@@ -449,7 +845,7 @@ export const stampAuthorOnInserts = (changeset, apoolJsonable, authorId) => {
 };
 ```
 
-### 7.2 协作客户端调用时机
+### 8.2 协作客户端调用时机
 
 在 [collab_client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/collab_client.ts#L59-L67) 的 `prepareUserChangeset` 中调用：
 
@@ -466,7 +862,7 @@ const prepareUserChangeset = () => {
 };
 ```
 
-### 7.3 服务端验证
+### 8.3 服务端验证
 
 在 [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L859-L920) 中，服务器会验证每个变更的作者属性：
 
@@ -496,11 +892,11 @@ for (const op of deserializeOps(unpack(changeset).ops)) {
 
 ---
 
-## 8. 颜色工具函数 (Color Utilities)
+## 9. 颜色工具函数 (Color Utilities)
 
 [colorutils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/colorutils.ts) 提供完整的颜色处理工具集：
 
-### 8.1 颜色格式转换
+### 9.1 颜色格式转换
 
 ```typescript
 colorutils.css2triple(cssColor)     // "#fff" → [1.0, 1.0, 1.0]
@@ -508,7 +904,7 @@ colorutils.css2sixhex(cssColor)     // "#fff" → "ffffff"
 colorutils.triple2css(triple)       // [1.0, 1.0, 1.0] → "#ffffff"
 ```
 
-### 8.2 WCAG 2.1 可访问性支持
+### 9.2 WCAG 2.1 可访问性支持
 
 为确保文本与背景色有足够对比度，实现了 WCAG 2.1 标准的对比度计算：
 
@@ -527,7 +923,7 @@ colorutils.contrastRatio = (c1, c2) => {
 };
 ```
 
-### 8.3 智能文本颜色选择
+### 9.3 智能文本颜色选择
 
 根据背景色自动选择深色或浅色文本以确保可读性：
 
@@ -541,7 +937,7 @@ colorutils.textColorFromBackgroundColor = (bgcolor, skinName) => {
 };
 ```
 
-### 8.4 背景色可读性保障
+### 9.4 背景色可读性保障
 
 如果背景色与文本对比度不足，自动调整背景色：
 
@@ -568,11 +964,11 @@ colorutils.ensureReadableBackground = (cssColor, skinName, minContrast = 4.5) =>
 
 ---
 
-## 9. 用户列表 UI 展示 (User List UI)
+## 10. 用户列表 UI 展示 (User List UI)
 
 [pad_userlist.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/pad_userlist.ts) 负责用户列表的渲染：
 
-### 9.1 颜色索引转颜色值
+### 10.1 颜色索引转颜色值
 
 ```typescript
 // 设置当前用户信息时转换颜色
@@ -585,7 +981,7 @@ setMyUserInfo: (info) => {
 };
 ```
 
-### 9.2 用户行渲染
+### 10.2 用户行渲染
 
 ```typescript
 const createUserRowTds = (height, data) => {
@@ -605,7 +1001,7 @@ const createUserRowTds = (height, data) => {
 };
 ```
 
-### 9.3 颜色选择器
+### 10.3 颜色选择器
 
 ```typescript
 const showColorPicker = () => {
@@ -627,9 +1023,9 @@ const showColorPicker = () => {
 
 ---
 
-## 10. 完整数据流图
+## 11. 完整数据流图
 
-### 10.1 新用户加入流程
+### 11.1 新用户加入流程
 
 ```
 浏览器连接
@@ -661,7 +1057,7 @@ CLIENT_VARS → 浏览器
 [Other Clients] userJoin 回调 → 更新用户列表、设置 ACE 作者颜色
 ```
 
-### 10.2 颜色修改流程
+### 11.2 颜色修改流程
 
 ```
 用户在 UI 选择新颜色
@@ -687,9 +1083,9 @@ CLIENT_VARS → 浏览器
 
 ---
 
-## 11. 关键设计权衡
+## 12. 关键设计权衡
 
-### 11.1 颜色分配策略
+### 12.1 颜色分配策略
 
 | 策略 | 优点 | 缺点 |
 |------|------|------|
@@ -699,13 +1095,13 @@ CLIENT_VARS → 浏览器
 
 **当前选择**：完全随机分配。对于 64 色的池，在常用协作场景（<10 人）中冲突概率较低，且用户可手动修改颜色。
 
-### 11.2 颜色 ID 的两种形式
+### 12.2 颜色 ID 的两种形式
 
 - **存储形式**：`colorId` 可以是数字索引（0-63）或直接存储 CSS 颜色字符串
 - **原因**：允许用户选择自定义颜色（不在预设池中），通过颜色选择器的自由取色功能
 - **处理**：在使用时检查 `typeof colorId === 'number'`，若是则从 colorPalette 查找
 
-### 11.3 历史作者的淡出处理
+### 12.3 历史作者的淡出处理
 
 - 历史作者（不在当前会话中）在编辑器中显示为 `fade: 0.5` 半透明
 - 但在用户列表中，离开的用户会在 8 秒后完全移除
@@ -713,14 +1109,24 @@ CLIENT_VARS → 浏览器
 
 ---
 
-## 12. 代码溯源索引
+## 13. 代码溯源索引
 
 | 功能模块 | 核心文件 | 关键函数/位置 |
 |---------|---------|-------------|
 | 颜色池定义 | [AuthorManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts) | `getColorPalette()` [L27-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts#L27-L92) |
 | 作者创建 | [AuthorManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts) | `createAuthor()` [L201-L212](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts#L201-L212) |
 | 作者映射 | [AuthorManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts) | `mapAuthorWithDBKey()` [L117-L141](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts#L117-L141) |
-| 会话管理 | [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts) | `createSession()` [L105-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L105-L159) |
+| 作者ID优先级决策 | [AuthorManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts) | `getAuthorId()` [L161-L166](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/AuthorManager.ts#L161-L166) |
+| 会话创建与反向索引 | [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts) | `createSession()` [L105-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L105-L159) |
+| 会话查找与过期验证 | [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts) | `findAuthorID()` [L39-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L39-L85) |
+| 会话删除与索引回收 | [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts) | `deleteSession()` [L184-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L184-L206) |
+| 反向索引列表（含僵尸处理） | [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts) | `listSessionsWithDBKey()` [L246-L263](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L246-L263) |
+| 群组删除级联会话清理 | [GroupManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/GroupManager.ts) | `deleteGroup()` [L46-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/GroupManager.ts#L46-L81) |
+| HTTP层访问认证/授权 | [webaccess.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/hooks/express/webaccess.ts) | 四步检查流程：preAuthorize→authorize→authenticate→authorize |
+| Socket层安全访问校验 | [SecurityManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SecurityManager.ts) | `checkAccess()` [L60-L150](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SecurityManager.ts#L60-L150) |
+| 浏览器Token Cookie下发 | [ensureAuthorTokenCookie.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/utils/ensureAuthorTokenCookie.ts) | `ensureAuthorTokenCookie()` 60天 maxAge / SameSite 自适应 |
+| 浏览器Token格式校验 | [pad_utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/pad_utils.ts) | `isValidAuthorToken(t)` `generateAuthorToken()` |
+| 连接级会话信息快照 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `sessioninfos[socket.id]` [L102-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L102-L103) |
 | 客户端初始化 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleClientReady()` [L1118-L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1118-L1458) |
 | 协作客户端 | [collab_client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/collab_client.ts) | `getCollabClient()` [L39-L529](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/collab_client.ts#L39-L529) |
 | 作者标记 | [stampAuthorOnInserts.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/stampAuthorOnInserts.ts) | `stampAuthorOnInserts()` [L31-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/static/js/stampAuthorOnInserts.ts#L31-L57) |
