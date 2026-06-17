@@ -168,8 +168,8 @@ catch 块见 [冲突处理](src/node/handler/PadMessageHandler.ts#L998-L1002):
 
 另一类"回滚"是用户主动回到历史版本,典型场景是时间轴(timeslider)与 `restoreRevision` API。它们用 [inverse](src/static/js/Changeset.ts#L1279)——给定一个 changeset 和它应用后的文档行,算出能把它"撤销"的逆 changeset。
 
-- **时间轴前/后退**:为支持播放/倒放,服务端预计算每个区段的正向与逆向 changeset 对,见 [getPadChangesetInfo 中的 inverse 调用](src/node/handler/PadMessageHandler.ts#L1586-L1600):`forwards` 是 r→r+n 的合成变更集,`backwards = inverse(forwards, lines...)` 是它的逆。客户端拿到这对数组就能在版本间双向滑动。
-- **restoreRevision**:[API.restoreRevision](src/node/db/API.ts#L599) 把历史某版的 atext 作为一条**新的正向 changeset** 追加到 head,见 [L633-L634](src/node/db/API.ts#L633)。它**不删除、不改写**任何历史版本,而是用 `appendRevision` 追加一个"恢复到旧貌"的新版本。这与脏写防护的"整体拒绝"是两套独立机制:历史永远是 append-only 的,所谓"回退"其实是"新建一个长得像旧版的新版"。
+- **时间轴前/后退**:为支持播放/倒放,服务端预计算每个区段的正向与逆向 changeset 对,见 [getChangesetInfo 中的 inverse 调用](src/node/handler/PadMessageHandler.ts#L1586-L1600):`forwards` 是 r→r+n 的合成变更集,`backwards = inverse(forwards, lines...)` 是它的逆。客户端拿到这对数组就能在版本间双向滑动。
+- **restoreRevision**:[API.restoreRevision](src/node/db/API.ts#L599) 把历史某版的 atext 构建为一条**新的正向 changeset**,再通过 `appendRevision` 追加到 head,见 [落库调用](src/node/db/API.ts#L669)。它**不删除、不改写**任何历史版本,而是追加一个"恢复到旧貌"的新版本。这与脏写防护的"整体拒绝"是两套独立机制:历史永远是 append-only 的,所谓"回退"其实是"新建一个长得像旧版的新版"。
 
 ---
 
@@ -179,7 +179,7 @@ catch 块见 [冲突处理](src/node/handler/PadMessageHandler.ts#L998-L1002):
 
 1. **客户端** A、B 同时编辑同一 pad。各自 `committing` 标志保证本地一次只发一个 changeset(第一节客户端侧)。
 2. 两份 `USER_CHANGES` 到达服务端,都进 [padChannels](src/node/handler/PadMessageHandler.ts#L207),按 `padId` 排进同一条 Promise 链——**A 先处理,B 在 await 中排队**(第一节服务端侧)。这把并发竞争消除在进入 OT 之前。
-3. A 的 changeset(假设 baseRev 已是 head)直接通过校验,[appendRevision](src/node/db/Pad.ts#L977) 落库,head 推进。
+3. A 的 changeset(假设 baseRev 已是 head)直接通过校验,在 [handleUserChanges 的落库点](src/node/handler/PadMessageHandler.ts#L977) 调用 `pad.appendRevision` 落库,head 推进。
 4. 轮到 B。B 的 `baseRev` 现在落后于 head,进入 [OT rebase 循环](src/node/handler/PadMessageHandler.ts#L939-L951),用 `follow(A的changeset, B的changeset)` 把 B 的意图挪到 A 之后,变成基于新 head 的合法 changeset(第二节)。
 5. rebase 后过长度/尾换行校验。通过则落库;若 rebase 出错或 changeset 畸形(第三节第一层),则**不落库**,直接 `badChangeset` 踢 B 下线重载,服务端 pad 状态毫发无损。
 
