@@ -362,29 +362,89 @@ rateLimiter = new RateLimiterMemory(settings.commitRateLimiting);
    - `pad.appendRevision(rebasedChangeset, author)`
    - 版本号 +1
 
-4. **确认提交**
+4. **确认提交 + 预更新提交者 session.rev**
    - 向提交者发送 `ACCEPT_COMMIT` 消息
-   - 更新该客户端的 `session.rev`
+   - **关键**：在调用 `updatePadClients` 之前，先把提交者的 `session.rev` 更新为新版本号
+   - 这是让提交者本人不被重复推送的核心技巧
 
 5. **广播给所有客户端**
    - 调用 `updatePadClients(pad)`
-   - 遍历所有在线用户，发送 `NEW_CHANGES` 消息
+   - 遍历所有在线用户（包括提交者本人），根据 `session.rev` 判断是否需要推送
 
-#### 关键代码：广播逻辑
+---
+
+#### 关键机制：提交者本人为何不被重复推送 NEW_CHANGES
+
+**完整时序**（[PadMessageHandler.ts L977-L997](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/node/handler/PadMessageHandler.ts#L977-L997)）：
 
 ```typescript
-// PadMessageHandler.ts L1008-L1066
+// 第 1 步：追加新版本到 Pad（假设从 rev=42 升到 rev=43）
+const newRev = await pad.appendRevision(rebasedChangeset, thisSession.author);
+// 此时：pad.getHeadRevisionNumber() = 43
+// 但：thisSession.rev 仍然是 42（提交者自己的旧版本号）
+
+// 第 2 步：断言确认——必须保证提交者的 rev 还是原来的 r（=42）
+assert.equal(thisSession.rev, r);
+
+// 第 3 步：向提交者发送 ACCEPT_COMMIT（确认消息）
+socket.emit('message', {type: 'COLLABROOM', data: {type: 'ACCEPT_COMMIT', newRev}});
+
+// 第 4 步：★★★ 关键操作——在广播前，先把提交者的 rev 更新！★★★
+thisSession.rev = newRev;  // 从 42 改成 43（注意：pad 的 head 已经是 43）
+if (newRev !== r) thisSession.time = await pad.getRevisionDate(newRev);
+
+// 第 5 步：调用 updatePadClients，遍历所有在线用户（包括提交者本人）
+await exports.updatePadClients(pad);
+```
+
+**`_getRoomSockets` 的工作方式**（[PadMessageHandler.ts L1670-L1682](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1670-L1682)）：
+
+```typescript
+const _getRoomSockets = (padID) => {
+  const ns = socketio.sockets;
+  const room = ns.adapter.rooms?.get(padID);
+  if (!room) return [];
+  // 直接从 Socket.io 房间适配器取所有 socket ID，包括提交者本人
+  return Array.from(room)
+    .map(socketId => ns.sockets.get(socketId))
+    .filter(socket => socket);
+};
+```
+
+**`updatePadClients` 中的跳过逻辑**（[PadMessageHandler.ts L1030-L1064](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1030-L1064)）：
+
+```typescript
 exports.updatePadClients = async (pad) => {
   const roomSockets = _getRoomSockets(pad.id);
-  
+  // 包括提交者本人的 socket，因为他也在房间里
+
+  const revCache = {}; // 缓存已查询的版本，避免重复读数据库
+
   await Promise.all(roomSockets.map(async (socket) => {
     const sessioninfo = sessioninfos[socket.id];
-    
-    // 逐个补发缺失的版本
+    if (sessioninfo == null) return;
+
+    // ★★ while 循环条件：sessioninfo.rev < pad.getHeadRevisionNumber() ★★
+    //
+    // 对于提交者（提交前 sessioninfo.rev = 42）：
+    //   因为第 4 步已经执行 thisSession.rev = newRev = 43
+    //   而 pad.getHeadRevisionNumber() = 43
+    //   所以：43 < 43 = false → while 循环体一次都不执行！
+    //
+    // 对于其他用户（sessioninfo.rev = 42）：
+    //   42 < 43 = true → 进入循环，发送 NEW_CHANGES rev=43
+    //   更新 sessioninfo.rev = 43
+    //   循环条件再次判断：43 < 43 = false → 退出
+
     while (sessioninfo.rev < pad.getHeadRevisionNumber()) {
       const r = sessioninfo.rev + 1;
-      const revision = await pad.getRevision(r);
-      
+      let revision = revCache[r];
+      if (!revision) {
+        revision = await pad.getRevision(r);
+        revCache[r] = revision;
+      }
+
+      const forWire = prepareForWire(revision.changeset, pad.pool);
       const msg = {
         type: 'COLLABROOM',
         data: {
@@ -392,17 +452,36 @@ exports.updatePadClients = async (pad) => {
           newRev: r,
           changeset: forWire.translated,
           apool: forWire.pool,
-          author,
-          currentTime,
-          timeDelta: currentTime - sessioninfo.time,
+          author: revision.meta.author,
+          currentTime: revision.meta.timestamp,
+          timeDelta: revision.meta.timestamp - sessioninfo.time,
         },
       };
       socket.emit('message', msg);
+      sessioninfo.time = revision.meta.timestamp;
       sessioninfo.rev = r;
     }
   }));
 };
 ```
+
+**设计要点总结**：
+
+| 设计选择 | 为什么这样做 |
+|---------|------------|
+| **不用 `socket.broadcast` 排除提交者** | `socket.broadcast` 只适合单条消息。`updatePadClients` 是通用函数，要处理**批量补发多个缺失版本**的场景，必须用 while 循环逐个推 |
+| **先更新 session.rev，再调用通用函数** | 提交者的 `session.rev` 先被更新为 newRev，进入 `while` 判断时刚好等于 head，自然跳过。这是"无侵入式排除"——同一个函数对所有用户逻辑完全一致，只是内部状态不同导致行为不同 |
+| **`revCache` 缓存优化** | 多个客户端同时缺失版本时，只从数据库读一次 |
+| **`thisSession.time` 更新** | `timeDelta` 用于客户端计算"这条变更是多久前发生的"，必须在推送前更新为新版本的时间戳 |
+
+**关于顺序保证的注释**（[PadMessageHandler.ts L987-L989](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/node/handler/PadMessageHandler.ts#L987-L989)）：
+
+```typescript
+// The client assumes that ACCEPT_COMMIT and NEW_CHANGES messages arrive in order.
+assert.equal(thisSession.rev, r);
+```
+
+单 socket 上的消息按发送顺序排队，客户端会先收到 `ACCEPT_COMMIT`，再收到其他用户的 `NEW_CHANGES`。
 
 ### 2.3 客户端接收 NEW_CHANGES
 
@@ -531,11 +610,199 @@ if (msg.type === 'CLIENT_RECONNECT') {
 }
 ```
 
-### 3.4 本地变更保存与重放
+### 3.4 本地输入拦截机制（isPendingRevision 的完整作用链）
 
-断线期间用户可能继续输入，这些本地变更需要在重连后重新提交。
+断线→重连期间，用户可以继续在本地输入，但**提交动作会被 `isPendingRevision` 标志拦截**，直到服务端补发的所有变更都应用完成。这个机制的核心不是"阻止用户输入"，而是"阻止在版本不一致的情况下提交"。
 
-**本地变更保存**：
+---
+
+#### 拦截点：`handleUserChanges` 门禁 5
+
+回看上文的"六段式门禁"，**门禁 5** 是拦截提交的关键：
+
+```typescript
+// collab_client.ts L134-L152
+let sentMessage = false;
+if (!isPendingRevision) {          // ★ 只有 isPendingRevision = false 才允许提交
+  const userChangesData = prepareUserChangeset();
+  if (userChangesData.changeset) {
+    // ... 真正执行提交 ...
+    sendMessage(stateMessage);
+    sentMessage = true;
+  }
+} else {
+  setTimeout(handleUserChanges, 3000); // 3秒后重试（兜底用，见下文）
+}
+```
+
+**重要**：`isPendingRevision` 只拦截**提交到服务端**的动作，不拦截**本地 DOM 输入**和**本地 Changeset 累积**。用户输入的每一个字符仍然会：
+1. 正常渲染在浏览器 DOM 上
+2. 被 ChangesetTracker 的 `composeUserChangeset` 捕获并累积到 `userChangeset` 变量
+3. 被 `setChangeCallbackTimeout` 调度回调 → 触发 `handleUserChanges`（但走到门禁 5 就 return）
+
+这确保了用户体验的连续性——本地输入不受任何影响，只是暂时不上传。
+
+---
+
+#### isPendingRevision 的置位（true）与复位（false）时机
+
+**置位为 true 的时刻**：
+
+客户端发送重连请求（`CLIENT_READY` + `reconnect: true`）后，**服务端开始补发变更之前**，客户端先把自己设为"待处理版本"状态：
+
+```typescript
+// collab_client.ts —— 在 setChannelState 内部被调用
+const setChannelState = (state, optMsg) => {
+  // ...
+  if (state === 'CONNECTED' || state === 'RECONNECTING') {
+    setIsPendingRevision(true);  // ★ 连接建立或重连尝试时，先置位
+  }
+  // ...
+};
+```
+
+也就是说：只要 Socket.io 断开过，无论重连成功与否，只要开始走连接/重连流程，客户端就先进入"拦截模式"。这是一个**保守策略**——宁可暂时不提交，也不在版本未对齐的情况下提交。
+
+---
+
+#### 复位为 false 的两个路径
+
+**路径 A：服务端补发完成（正常路径）**
+
+服务端逐个发送 `CLIENT_RECONNECT` 消息，每条消息携带 `headRev`（总版本数）和 `newRev`（当前这条消息对应的版本号）。客户端每接收一条就检查：
+
+```typescript
+// collab_client.ts L242-L267
+if (msg.type === 'CLIENT_RECONNECT') {
+  serverMessageTaskQueue.enqueue(() => {
+    if (msg.noChanges) {
+      setIsPendingRevision(false);  // ★ 如果没有任何变更需要补，直接恢复
+      return;
+    }
+    const {headRev, newRev, changeset, author = '', apool} = msg;
+    // ... 应用变更或 acceptCommit ...
+    rev = newRev;
+    if (author === pad.getUserId()) {
+      acceptCommit();  // 自己的旧提交，直接确认
+    } else {
+      editor.applyChangesToBase(changeset, author, apool);  // 别人的变更，应用到文档
+    }
+    if (newRev === headRev) {
+      // ★★★ 当收到的版本等于 headRev 时，说明补发完毕
+      setIsPendingRevision(false);
+    }
+  });
+}
+```
+
+**路径 B：没有缺失的变更**
+
+如果断线期间恰好没有任何其他用户修改文档，服务端发送的第一条 `CLIENT_RECONNECT` 就会带 `noChanges: true`，客户端直接恢复：
+
+```typescript
+// collab_client.ts L246-L249
+if (msg.noChanges) {
+  setIsPendingRevision(false);  // 无变更，直接退出拦截模式
+  return;
+}
+```
+
+---
+
+#### 复位后的自动提交流程（`setIsPendingRevision` 的副作用）
+
+`setIsPendingRevision` 不是一个简单的 setter，它带有状态转换检测：
+
+```typescript
+// collab_client.ts L451-L461
+const setIsPendingRevision = (value) => {
+  const wasPending = isPendingRevision;  // 记录转换前的状态
+  isPendingRevision = value;             // 执行赋值
+
+  // ★ 关键：只有当状态从 true → false（即"等待中→恢复正常"的转换边沿）
+  // 才会触发 handleUserChanges，立即提交本地累积的变更
+  if (wasPending && !value) {
+    handleUserChanges();
+  }
+};
+```
+
+这个**边沿触发**设计非常重要：
+- `false → true`（进入等待）：不需要做任何事，因为下一次 `handleUserChanges` 自然会在门禁 5 被拦住
+- `true → false`（恢复正常）：必须**立即**调用 `handleUserChanges`，否则就只能等 3 秒的兜底轮询（门禁 5 的 else 分支），用户会感知到明显的延迟
+
+---
+
+#### 兜底轮询机制
+
+在 `isPendingRevision = true` 期间，门禁 5 的 else 分支设置了 3 秒一次的轮询：
+
+```typescript
+} else {
+  setTimeout(handleUserChanges, 3000);  // 3秒后重试
+}
+```
+
+这个轮询存在的意义是**防止 `setIsPendingRevision(false)` 因异常未被调用**（例如网络异常导致最后一条 `CLIENT_RECONNECT` 丢失）。如果一切正常，这个轮询永远不会触发到实际的提交——因为边沿触发会先一步调用 `handleUserChanges`。轮询只是双保险。
+
+---
+
+### 3.5 本地变更保存与重放（ChangesetTracker 内部的三层状态机）
+
+断线期间用户可能继续输入，这些本地变更需要在重连后重新提交。ChangesetTracker 内部维护了三层状态，用于区分"已提交未确认"和"未提交"的变更，确保重连后两者都能正确重放。
+
+**ChangesetTracker 三层状态**（[changesettracker.ts L88-L148](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/changesettracker.ts#L88-L148)）：
+
+| 变量 | 含义 |
+|------|------|
+| `baseAText` | **基准文本**——服务端确认的最后一个版本对应的带属性文本 |
+| `submittedChangeset` | **已提交但未确认**的变更（即上一次 `USER_CHANGES` 发送出去但还没收到 `ACCEPT_COMMIT`） |
+| `userChangeset` | **未提交**的变更（本地新输入，还没发出去） |
+
+每次接收服务端变更（`applyChangesToBase`）时，这三者会通过 `follow()` 函数一起前进，确保本地用户的光标和输入位置始终正确跟随文档变化：
+
+```typescript
+// changesettracker.ts L110-L130
+applyChangesToBase: (c, optAuthor, apoolJsonObj) => {
+  baseAText = applyToAText(c, baseAText, apool);  // 基准前进
+
+  if (submittedChangeset) {
+    // 让"已提交未确认"的变更跟随服务端变更前进（变基）
+    submittedChangeset = follow(c, oldSubmittedChangeset, false, apool);
+    c2 = follow(oldSubmittedChangeset, c, true, apool);
+  }
+
+  // 让"未提交"的本地变更也跟随前进（保持用户输入的相对位置）
+  userChangeset = follow(c2, oldUserChangeset, preferInsertingAfterUserChanges, apool);
+
+  // 最终把合并后的变更实际应用到 DOM
+  applyingNonUserChanges = true;
+  try {
+    callbacks.applyChangesetToDocument(postChange, preferInsertionAfterCaret);
+  } finally {
+    applyingNonUserChanges = false;  // 确保标志位一定被重置
+  }
+}
+```
+
+注意 `applyingNonUserChanges` 标志位的作用——在应用非用户变更的过程中，DOM 会发生变化（其他人的新文本插入），这些变化**不能**被当作用户新输入再次捕获，所以 `composeUserChangeset` 会直接 return：
+
+```typescript
+// changesettracker.ts L91-L98
+composeUserChangeset: (c) => {
+  if (!tracking) return;
+  if (applyingNonUserChanges) return;  // ★ 应用服务端变更期间的 DOM 变化不捕获
+  if (isIdentity(c)) return;
+  userChangeset = compose(userChangeset, c, apool);
+  setChangeCallbackTimeout();
+}
+```
+
+---
+
+**本地变更的收集（`getMissedChanges`）**：
+
+在进入重连流程之前，客户端通过 `getMissedChanges()` 把三层状态拍平成两层（"已提交"和"未提交"），供后续可能的重连重放使用：
 
 ```typescript
 // collab_client.ts L428-L443
@@ -544,14 +811,15 @@ const getMissedChanges = () => {
   obj.userInfo = userSet[userId];
   obj.baseRev = rev;
   
-  // 已提交但未确认的变更
+  // 第 1 层：已提交但未确认的变更
   if (committing && stateMessage) {
     obj.committedChangeset = stateMessage.changeset;
     obj.committedChangesetAPool = stateMessage.apool;
+    // 把 submittedChangeset 合并进 baseAText（因为服务端可能已经接受了它）
     editor.applyPreparedChangesetToBase();
   }
   
-  // 未提交的本地变更
+  // 第 2 层：未提交的本地变更
   const userChangesData = prepareUserChangeset();
   if (userChangesData.changeset) {
     obj.furtherChangeset = userChangesData.changeset;
@@ -561,23 +829,16 @@ const getMissedChanges = () => {
 };
 ```
 
-**重连后恢复**：
-- `isPendingRevision = true` 期间，本地变更暂不提交
-- 所有服务端补发的变更应用完成后，`isPendingRevision = false`
-- 触发 `handleUserChanges()` 重新提交本地累积的变更
-
-```typescript
-// collab_client.ts L451-L461
-const setIsPendingRevision = (value) => {
-  const wasPending = isPendingRevision;
-  isPendingRevision = value;
-  
-  // 待处理版本全部应用完后，刷新本地变更
-  if (wasPending && !value) {
-    handleUserChanges();
-  }
-};
-```
+**重连后恢复的完整时序**：
+1. Socket.io 断线 → `channelState` 变为 `DISCONNECTED` / `RECONNECTING`
+2. `setIsPendingRevision(true)` → 门禁 5 开始拦截提交
+3. 用户继续输入 → DOM 正常渲染 → ChangesetTracker 累积到 `userChangeset`
+4. Socket.io 自动重连成功 → 发送 `CLIENT_READY` + `reconnect: true`
+5. 服务端逐个补发 `CLIENT_RECONNECT` 消息
+6. 客户端每条都应用（别人的变更）或确认（自己的变更）
+7. 最后一条 `CLIENT_RECONNECT`（`newRev === headRev`）→ `setIsPendingRevision(false)`
+8. **边沿触发**：`wasPending=true, value=false` → 立即调用 `handleUserChanges()`
+9. 此时门禁 5 不再拦截 → 把累积了整个断线期间的 `userChangeset` 合并提交
 
 ---
 
