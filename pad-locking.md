@@ -109,18 +109,61 @@ sendMessage(stateMessage);
 
 #### 并发竞态:旁路写入与协作编辑同时发生时会怎样
 
-由于旁路写入不进 `padChannels`,因此它和正在处理中的 USER_CHANGES 之间**没有串行化保证**。Node.js 单线程保证了同步代码的原子性,但 `appendRevision` 是 async 函数——内部有 `await this.db.set(...)` 等异步点。如果:
+由于旁路写入不进 `padChannels`,因此它和正在处理中的 USER_CHANGES 之间**没有串行化保证**。但 Node.js 单线程 + `appendRevision` 的具体实现决定了竞态窗口的真实形态,与"后完成覆盖先完成"的简单结论不同。需要顺着代码执行顺序逐段分析。
 
-- 一个 USER_CHANGES 走到一半(已计算 atext,head 已 ++,但 db.set 还在 await 中);
-- 这时一个 setText API 调用并发进入,也调了 `appendRevision`;
+**`appendRevision` 执行时序分解**([Pad.ts#L280-L335](src/node/db/Pad.ts#L280-L335)):
 
-那么两个调用会**各自计算 changeset → copyAText → ++head → 落库**。结果是:后完成的那一份会覆盖先完成前一份的结果,这是一种真正的脏写。
+```
+ 调用方 enter appendRevision
+      │
+      ▼
+[L286] _assertInsertOpsCarryAuthor    ◀── 同步
+[L288] applyToAText → newAText        ◀── 同步，纯函数计算新 AText
+[L289] 幂等短路检查                    ◀── 同步，比较新/旧文本
+[L293] copyAText(newAText, this.atext)◀── 同步，内存 AText 已更新
+[L295] ++this.head                     ◀── 同步，内存 head 已推进
+[L298] pool.putAttrib                  ◀── 同步
+      │
+      ▼
+[L301] await Promise.all([            ◀── 同步边界：前面 13 行全同步，
+   db.set(revision record),             │ 一个 await 都没有；
+   saveToDatabase(),                    │ 这里才第一次让出事件循环
+   authorManager.addPad(...),
+   hooks.aCallAll(...),
+])                                    ◀── 异步等待，其他逻辑可插入
+      │
+      ▼
+   return newRev
+```
 
-实践中这种情况发生率较低,因为:
-- 旁路写入频率远低于协作编辑频率;
-- 单进程内 async 函数的 await 挂起点在大多数时候错开;
+##### 可确定的结论（由代码明确保证）
 
-但这是设计上的明确取舍:`padChannels` 只保护协作编辑这条高频路径,不追求全量写入一致性。如果业务上需要保证并发安全,需要调用方自己加锁或排队。
+1. **[L288-L298] 是单线程原子区**：`applyToAText`、`copyAText`、`++this.head` 全程同步执行，中间不会插入任何其他 JavaScript 逻辑。两个 `appendRevision` 调用永远不会在这 11 行中间交错。要么 A 的这 11 行先完整执行完，再执行 B 的这 11 行；要么反过来。这意味着 `this.atext` 和 `this.head` 在内存层面永远是一致的——不会出现"atext 是 A 算的、head 是 B 算的"这种撕裂。
+
+2. **谁先进入 L286，谁的写入就在内存层面先生效**：如果 A 先调用 `appendRevision` 并通过了 L289 的幂等检查，那么 `this.atext` 就是 A 写进去的版本，`this.head` 也会因 A 的 `++` 而增加；B 随后进入 L288 时，`applyToAText` 拿到的 `this.atext` 已经是 A 改过后的版本——**B 的 changeset 计算就基于了 A 已经改过的 atext**。这与"基于旧版本的脏写"正好相反：后进入的 B 的 changeset 计算其实是基于了先行者 A 已经更新过的内存状态。
+
+3. **`getHeadRevisionNumber()` 是同步读内存**：([Pad.ts#L240-L241](src/node/db/Pad.ts#L240-L241))。在 OT rebase 循环里（[PadMessageHandler.ts#L939](src/node/handler/PadMessageHandler.ts#L939)）每次判断 `r < pad.getHeadRevisionNumber()` 都是读内存中的 `this.head`，不是读 DB。所以如果旁路写入先执行了 L295 的 `++this.head`，那么正在进行中的 OT rebase 循环会"看到"这个新 head，继续 rebase 越过它。
+
+4. **持久化在内存更新之后**：L301 的 `db.set` / `saveToDatabase` 是在 L293 和 L295 内存更新之后。所以内存状态领先于持久化状态是常态。
+
+##### 不可确定的边界（代码未作保证）
+
+1. **两个异步函数的调用顺序不可控**：如果一个 USER_CHANGES 处理流程和一个 HTTP API `setText` 都准备调用 `appendRevision`，**谁先进入 L286 取决于 Node.js 事件循环的调度**，不是由代码顺序决定的。`handleUserChanges` 里的 `await pad.getRevision(r)`、`await pad.appendRevision(...)` 都是挂起点，API 路由在这些挂起点随时可能穿插进来。
+
+2. **落库失败不回滚内存**：L301 里如果某个 `db.set` 失败（如数据库不可达），`Promise.all` 会 reject，但 L293/L295 已经把 `this.atext` 和 `this.head` 改了——**内存状态已经不可逆地前进了，不会因为持久化失败而回滚**。这是设计上的另一个取舍：把内存状态作为真相源，持久化只是事后记录。
+
+3. **旁路 + 协作并发时，谁的 changeset 会真正留在版本链里**：假设时序是：A(协作编辑)先进入 L286→完成 L295→挂在 L301 等待持久化；此时 B(旁路)被调度到，也进入 L286→完成 L295(head 又被 ++)→挂在 L301。那么 A 的 `db.set(revs:N)` 写的是版本 N，B 的 `db.set(revs:N+1)` 写的是版本 N+1。**两者的 changeset 都会留在版本链里，不存在后完成的覆盖先完成的**——因为版本号是分配的，不是覆盖的。真正可能发生的是：B 在 L288 `applyToAText` 时基于了 A 已更新的 atext，B 的 changeset 是"在 A 的结果之上再改"；但如果 B 的 changeset 本身是基于更旧的外部文本（如 `setText("全新内容")` 而非基于当前 pad 文本的 diff），那么 A 在内存里做的修改会被 B 整体替换——这是业务语义上的覆盖，不是版本号覆盖。
+
+##### 重新校准后的结论
+
+- **不会发生 "A 写一半被 B 打断导致数据撕裂"**：因为 L288-L298 是原子同步区。
+- **不会简单 "后完成覆盖先完成"**：版本号是递增分配的，每个 changeset 落在独立的版本号上。
+- **真正的风险是时序依赖的业务语义不一致**：
+  - 旁路写入的 changeset 如果是外部传入的完整文本替换（如 `setText`），而非基于当前 pad 状态的 diff，那么后执行的那个会整体覆盖先行者的结果，这是业务语义上的覆盖，不是底层并发 bug。
+  - 正在进行的 USER_CHANGES 正在 OT rebase 循环中，如果旁路写入同步推进了 `this.head`，rebase 循环会继续多走一轮，把旁路那版也 rebase 过去——这是 OK 的。但如果旁路写入发生在 rebase 循环之后、`appendRevision` 之前，那么 USER_CHANGES 的 changeset 就基于了被旁路更新过的内存 atext，结果是正确的。
+- **实践中出现问题的概率很低**，不是因为 async 挂起点错开，而是因为：(a) L288-L298 原子性保证了内存一致性；(b) 版本号递增机制让两个写入都能落库不覆盖；(c) 只有当旁路写入是整体文本替换且与协作编辑严格同时时，才会出现业务语义上的"后者覆盖前者"。
+
+> 设计底线：`padChannels` 只保护协作编辑这条高频路径，不追求所有写入路径的全局串行。如果业务场景要求"HTTP API 调用期间禁止协作编辑"或"所有写入严格按请求到达顺序执行"，调用方需要在更外层自行加锁（如分布式锁、任务队列串行化所有写入）。
 
 ---
 
@@ -237,7 +280,7 @@ catch 块见 [冲突处理](src/node/handler/PadMessageHandler.ts#L998-L1002):
 
 一句话总结:**锁把并发变成串行,OT 把串行后的过期基线纠正到当前版本,校验先于提交则保证纠正不了的脏写被整体拒之门外而不留痕迹**。三者缺一:没有锁,OT 要处理真正的并发覆盖;没有 OT,串行也救不了过期基线;没有校验先于提交,畸形 changeset 就会污染 pad 的版本链与文本。
 
-> 以上协同路径**只适用于协作编辑的 USER_CHANGES 消息**。HTTP API、文件导入、插件直接调用 pad 方法等旁路写入,既不进 `padChannels` 队列,也不经过 OT rebase 和作者属性校验,直接 `appendRevision` 落库,再由 `updatePadClients` 把 NEW_CHANGES 推给在线客户端。旁路写入与协作编辑并发时存在竞态窗口,实践中靠"旁路频率低 + async 挂起点多错开"来降低概率,但设计上不保证严格互斥。如果业务场景需要所有写入都串行,调用方需自行加锁。
+> 以上协同路径**只适用于协作编辑的 USER_CHANGES 消息**。HTTP API、文件导入、插件直接调用 pad 方法等旁路写入，既不进 `padChannels` 队列，也不经过 OT rebase 和作者属性校验，直接 `appendRevision` 落库，再由 `updatePadClients` 把 NEW_CHANGES 推给在线客户端。旁路写入与协作编辑并发时，**不会发生内存数据撕裂**（`appendRevision` 的 L288-L298 是原子同步区，`atext` 与 `head` 永远一致），也不会简单地"后完成覆盖先完成"（版本号递增分配，各走各的版本号）；真正的风险是**时序依赖的业务语义不一致**——如果旁路写入是整体文本替换而非 diff，后执行的那一个会在业务语义上覆盖前者。设计上不追求全量写入一致性，如业务要求严格串行，调用方需自行加锁。
 
 ---
 
