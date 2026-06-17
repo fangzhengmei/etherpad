@@ -673,10 +673,49 @@ Socket.io 事件 ──→ 处理函数
 ──────────────────────────────────────
 1. socket.on('disconnect')        ──→ socketReconnecting()
 2. socket.io.on('reconnect_attempt') ──→ socketReconnecting（直接绑定函数）
-3. socket.on('error')             ──→ 独立处理（不经过 socketReconnecting）
-4. socket.io.on('reconnect')      ──→ setChannelState('CONNECTED') + sendClientReady(true)
-5. socket.once('connect')         ──→ sendClientReady(false)
+3. socket.io.on('reconnect')      ──→ setChannelState('CONNECTED') + sendClientReady(true)
+4. socket.io.on('reconnect_failed') ──→ setChannelState('DISCONNECTED') ★ 终态
+5. socket.on('error')             ──→ setStateIdle + setIsPendingRevision(true)
+6. socket.once('connect')         ──→ sendClientReady(false)
 ```
+
+**事件触发顺序**（从断线到重连成功/失败的完整生命周期）：
+
+```
+disconnect  ← 连接刚断，立即触发
+     ↓
+reconnect_attempt  ← 第 1 次重连尝试（1s 后）
+     ↓  （失败）
+reconnect_attempt  ← 第 2 次重连尝试（2s 后）
+     ↓  （失败）
+     ...
+     ↓
+reconnect_attempt  ← 第 5 次重连尝试（5s 后）
+     ↓  （失败）
+reconnect_failed  ← 5 次全部失败，进入终态
+     ↓
+（只能靠用户手动点"重新连接"按钮，或自动重连定时器触发整页重载）
+```
+
+**Socket.io 重连参数**（[pad.ts L361-L367](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/pad.ts#L361-L367)）：
+
+```typescript
+socket = pad.socket = socketio.connect(exports.baseURL, '/', {
+  query: {padId},
+  reconnectionAttempts: 5,      // 最多 5 次重连尝试
+  reconnection: true,           // 启用自动重连
+  reconnectionDelay: 1000,      // 首次延迟 1000ms
+  reconnectionDelayMax: 5000,   // 最大延迟 5000ms（指数退避的上限）
+});
+```
+
+退避策略：第 n 次尝试的延迟 = `min(reconnectionDelay * 2^(n-1), reconnectionDelayMax)`
+- 第 1 次：1000ms
+- 第 2 次：2000ms
+- 第 3 次：4000ms
+- 第 4 次：5000ms（达到上限）
+- 第 5 次：5000ms
+- 5 次都失败 → `reconnect_failed`
 
 **`socketReconnecting` 函数**（[pad.ts L381-L388](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/pad.ts#L381-L388)）：
 
