@@ -645,30 +645,113 @@ const listSessionsWithDBKey = async (dbkey) => {
 | **反向索引膨胀** | `group2sessions:` 对象持续增长，`setSub` 的读改写成本上升 |
 | **颜色归属混淆** | 若管理员误将 `validUntil` 设得极长（999999999999），即使用户退出登录也会一直使用旧 authorID |
 
-### 5.7 连接级会话信息 (sessioninfos)
+### 5.7 连接级会话信息 (sessioninfos) 的精确生命周期
 
-在 [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L102-L103) 中，每个 socket 连接在内存中维护会话信息：
+`sessioninfos` 是 [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L102-L103) 中维护的内存对象，记录每个 socket 连接的颜色归属状态。它的每个属性在**不同的代码位置、不同的时机**被写入，理解这个时序是搞清会话过期与颜色归属关系的关键。
 
-```typescript
-const sessioninfos = {
-  [socketId]: {
-    auth: { padID, sessionID, token },  // 认证信息
-    author: string,                      // 作者 ID
-    padId: string,                       // Pad ID
-    readOnlyPadId: string,               // 只读 Pad ID
-    readonly: boolean,                   // 是否只读
-    rev: number,                         // 已应用的最新修订号
-    time: number,                        // 最新修订时间戳
-    embed: boolean,                      // 是否为嵌入模式
-  }
-};
+#### 5.7.1 sessioninfos 各属性的写入时序
+
+```
+时间线                    代码位置                              写入的属性
+─────────────────────────────────────────────────────────────────────────
+T1: Socket.IO 连接建立   handleConnect() [L221-L226]         sessioninfos[socket.id] = {}
+                                                                   → {} 空对象，author = undefined
+
+T2: CLIENT_READY 消息    handleMessage() [L398-L486]         thisSession.auth = {sessionID, padID, token}
+  (仅此消息类型)          ├── Cookie 解析                       thisSession.embed = ...
+                          ├── padId 解析                       thisSession.padId = padIds.padId
+                          └── readOnly 判断                    thisSession.readOnlyPadId = ...
+                                                               thisSession.readonly = ...
+
+T3: 每条消息             handleMessage() [L503-L522]         ★ thisSession.author = authorID ★
+  (含 CLIENT_READY)       ├── checkAccess() 返回 authorID         首次: undefined → 'a.xxxxx'
+                          ├── L510 比较 authorID 是否变化          后续: 'a.xxxxx' → 'a.xxxxx' (幂等覆写)
+                          └── L522 写入                           若变化: disconnect:'rejected' → 不走到这里
+
+T4: CLIENT_READY 分支    handleClientReady() [L1118-L1458]   sessionInfo.rev = message.client_rev
+  (正常连接)              ├── L1121 assert(sessionInfo.author)   sessionInfo.time = ...
+  或 reconnect 分支       └── [L1208-L1269 reconnect]           (author 不在 handleClientReady 中写入，
+                                                                而是在 handleMessage L522 已经写入)
+
+T5: USER_CHANGES         handleUserChanges() [L819-L1006]    thisSession.rev = newRev
+  (每次打字提交)          └── L995                              thisSession.time = ...
+                                                               (author 来自 thisSession.author 只读引用)
+
+T6: Socket 断开          handleDisconnect() [L246-L287]      delete sessioninfos[socket.id]
+                          └── L249                              → 立即删除，先于 USER_LEAVE 广播
 ```
 
-**关键性能优化**：
-- `sessioninfos[socket.id].author` 是连接建立时的**内存快照**
-- 后续 `USER_CHANGES` 变更校验直接使用内存中的 `thisSession.author`，不再每次查库
-- **连接期间不重新校验会话是否过期**：只要 Socket 不断开，即使 `session.validUntil` 已到，颜色归属仍保持连接初始时的 authorID
-- 断连后重连：触发新一轮 SecurityManager.checkAccess，此时才会检测到会话过期并降级
+#### 5.7.2 关键代码：authorID 写入与校验的精确位置
+
+[handleMessage L503-L522](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L503-L522)：
+
+```typescript
+// ★ 从 HTTP 请求中提取已认证的用户信息（express-session）
+const {session: {user} = {}} = socket.client.request as SocketClientRequest;
+
+// ★ 每条消息都重新调用 checkAccess
+//    参数来源：thisSession.auth 在 CLIENT_READY 时写入，后续消息复用
+const {accessStatus, authorID} =
+    await securityManager.checkAccess(auth.padID, auth.sessionID, auth.token, user);
+
+if (accessStatus !== 'grant') {
+  socket.emit('message', {accessStatus});
+  throw new Error('access denied');
+}
+
+// ★ authorID 变化检测
+//    thisSession.author 在首次消息时为 undefined (nullish)，不会进入此 if
+//    从第二条消息起，thisSession.author 已有值，任何变化都会触发 reject
+if (thisSession.author != null && thisSession.author !== authorID) {
+  socket.emit('message', {disconnect: 'rejected'});
+  throw new Error([
+    'Author ID changed mid-session. Bad or missing token or sessionID?',
+    `socket:${socket.id}`,
+    `IP:${logIp(socket.request.ip)}`,
+    `originalAuthorID:${thisSession.author}`,   // T3 首次写入的值
+    `newAuthorID:${authorID}`,                  // 本次 checkAccess 算出的值
+    ...(user && user.username) ? [`username:${user.username}`] : [],
+    `message:${message}`,
+  ].join(' '));
+}
+
+// ★ 幂等覆写：每条消息都写一次，值不变则为幂等操作
+thisSession.author = authorID;
+```
+
+#### 5.7.3 auth 对象的生命周期：Cookie 快照而非实时读取
+
+[L462-L469](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L462-L469) 的注释明确说明了 auth 的来源：
+
+> "Remember this information since we won't have the cookie in further socket.io messages. This information will be used to check if the sessionId of this connection is still valid since it could have been deleted by the API."
+
+**关键含义**：
+- `auth.token` 和 `auth.sessionID` 是从 CLIENT_READY 消息到达时的 **HTTP Cookie 头一次性快照**
+- Socket.IO 后续消息**不再携带 Cookie**，所以 checkAccess 每次使用的 `auth.token` / `auth.sessionID` 都是同一个快照值
+- 这意味着：
+  - 如果用户在另一个标签页清除了浏览器 Cookie → 当前连接的 auth 不受影响 → 仍用旧 token 继续校验
+  - 如果管理员在 API 端 `deleteSession` → auth.sessionID 对应的 session 记录从数据库删除 → 下一条消息 checkAccess 中 `findAuthorID()` 会返回 undefined → authorID 降级到 token → 触发 rejected
+
+#### 5.7.4 handleClientReady 中 authorID 的角色：只读使用而非写入
+
+[handleClientReady L1118-L1121](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1118-L1121)：
+
+```typescript
+const sessionInfo = sessioninfos[socket.id];
+if (sessionInfo == null) throw new Error('client disconnected');
+assert(sessionInfo.author);  // ★ 证明 author 在 handleMessage 中已写入
+```
+
+**assert(sessionInfo.author) 的重要性**：
+- `handleClientReady` 在 `handleMessage` 的 switch 分支 (L569) 中被调用
+- 调用之前 L522 已经执行了 `thisSession.author = authorID`
+- 所以 `handleClientReady` 中的 `sessionInfo.author` 一定有值（否则 assert 失败）
+- `handleClientReady` 只**读取** `sessionInfo.author`，用于：
+  - 写入颜色/名称到数据库 (`setAuthorColorId`, `setAuthorName`)
+  - 收集历史作者信息 (`pad.getAllAuthors()`)
+  - 组装 clientVars (`userId: sessionInfo.author`)
+  - 同作者踢出检测 (`sinfo.author === sessionInfo.author`)
+  - 判断是否为 pad 创建者 (`sessionInfo.author === pad.getRevisionAuthor(0)`)
 
 ---
 
@@ -1216,3 +1299,7 @@ CLIENT_VARS → 浏览器
 | 用户信息更新 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleUserInfoUpdate()` [L771-L803](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L771-L803) |
 | 断开连接 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleDisconnect()` [L246-L287](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L246-L287) |
 | 变更验证 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleUserChanges()` 验证 [L859-L920](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L859-L920) |
+| 消息处理全流程 + authorID变化拒绝 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleMessage()` [L377-L614](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L377-L614)，每次调用 checkAccess + 比较 authorID 是否变化 [L503-L521](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L503-L521) |
+| 4层作者冒充拒绝（内层防线） | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleUserChanges()` op 循环 [L853-L920](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L853-L920)：属性编号合法性 / 跨 author 拒绝 / + 操作必有 author / 系统作者硬禁止 |
+| 连接中会话过期实时检测 | [SessionManager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts) + [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `findAuthorID()` [L39-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/db/SessionManager.ts#L39-L85) 实时 `now < validUntil`，每条消息重跑 + 触发 'rejected' 断开 |
+| 重连流程 + 耐久身份判断 | [PadMessageHandler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts) | `handleClientReady()` reconnect 分支 [L1208-L1269](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1208-L1269) + `hasDurableIdentity` 作者耐久判断 [L1295-L1327](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1295-L1327) |
