@@ -646,22 +646,141 @@ if (!isPendingRevision) {          // ★ 只有 isPendingRevision = false 才�
 
 #### isPendingRevision 的置位（true）与复位（false）时机
 
-**置位为 true 的时刻**：
-
-客户端发送重连请求（`CLIENT_READY` + `reconnect: true`）后，**服务端开始补发变更之前**，客户端先把自己设为"待处理版本"状态：
+**⚠️ 重要修正**：之前的代码是错误的。`setChannelState` 函数体内**根本没有**置位逻辑！实际的 `setChannelState` 实现非常简单（[collab_client.ts L374-L379](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/collab_client.ts#L374-L379)）：
 
 ```typescript
-// collab_client.ts —— 在 setChannelState 内部被调用
-const setChannelState = (state, optMsg) => {
-  // ...
-  if (state === 'CONNECTED' || state === 'RECONNECTING') {
-    setIsPendingRevision(true);  // ★ 连接建立或重连尝试时，先置位
+// collab_client.ts L374-L379 —— 真实的 setChannelState，没有置位逻辑！
+const setChannelState = (newChannelState, moreInfo) => {
+  if (newChannelState !== channelState) {
+    channelState = newChannelState;
+    callbacks.onChannelStateChange(channelState, moreInfo);
   }
-  // ...
 };
 ```
 
-也就是说：只要 Socket.io 断开过，无论重连成功与否，只要开始走连接/重连流程，客户端就先进入"拦截模式"。这是一个**保守策略**——宁可暂时不提交，也不在版本未对齐的情况下提交。
+**置位为 true 的真实时机**：
+
+`isPendingRevision` 被设为 true，**不是在 `setChannelState` 内部**，而是在 **pad.ts** 的三个事件处理函数中**显式调用**的。
+
+---
+
+#### 完整事件绑定与调用链（pad.ts）
+
+**事件绑定**（都在 [pad.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/pad.ts)）：
+
+```
+Socket.io 事件 ──→ 处理函数
+──────────────────────────────────────
+1. socket.on('disconnect')        ──→ socketReconnecting()
+2. socket.io.on('reconnect_attempt') ──→ socketReconnecting（直接绑定函数）
+3. socket.on('error')             ──→ 独立处理（不经过 socketReconnecting）
+4. socket.io.on('reconnect')      ──→ setChannelState('CONNECTED') + sendClientReady(true)
+5. socket.once('connect')         ──→ sendClientReady(false)
+```
+
+**`socketReconnecting` 函数**（[pad.ts L381-L388](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/pad.ts#L381-L388)）：
+
+```typescript
+const socketReconnecting = () => {
+  if (pad.collabClient != null) {
+    // ★ 第 1 步：重置提交状态（把 committing 设为 false）
+    pad.collabClient.setStateIdle();
+    // ★ 第 2 步：置位拦截标志（门禁 5 开始拦截提交）
+    pad.collabClient.setIsPendingRevision(true);
+    // ★ 第 3 步：更新连接状态（UI 显示"正在重连"）
+    pad.collabClient.setChannelState('RECONNECTING');
+  }
+};
+```
+
+**三步调用顺序的设计考量**：
+
+| 顺序 | 调用 | 作用 |
+|------|------|------|
+| 1 | `setStateIdle()` | 重置 `committing = false`，清除可能残留的提交中状态。如果断线前恰好有一个 USER_CHANGES 发出去但还没收到 ACCEPT_COMMIT，这个状态就不对了，必须重置。同时执行 `idleFuncs` 队列中等待的函数 |
+| 2 | `setIsPendingRevision(true)` | 核心拦截标志置位。这个必须在 `setChannelState` 之前，因为状态切换回调可能会触发一些检查 |
+| 3 | `setChannelState('RECONNECTING')` | 更新 `channelState` 并触发 UI 回调（显示"连接中断，正在重连…"） |
+
+---
+
+**`error` 事件的特殊处理**（[pad.ts L437-L446](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/pad.ts#L437-L446)）：
+
+```typescript
+socket.on('error', (error) => {
+  if (pad.collabClient != null) {
+    pad.collabClient.setStateIdle();
+    pad.collabClient.setIsPendingRevision(true);
+    // ★ 注意：这里没有调用 setChannelState('RECONNECTING')！
+  }
+});
+```
+
+**为什么 error 事件不调用 setChannelState？**
+- `error` 只是连接异常（如偶发的网络错误），不一定会断开
+- 如果改变 `channelState`，UI 会频繁闪烁"正在重连"提示
+- 保守起见仍然拦截提交（防止版本不一致），但不打扰用户
+
+---
+
+**`reconnect` 事件的处理**（[pad.ts L373-L379](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/pad.ts#L373-L379)）：
+
+```typescript
+socket.io.on('reconnect', () => {
+  if (pad.collabClient != null) {
+    pad.collabClient.setChannelState('CONNECTED');
+  }
+  sendClientReady(receivedClientVars);  // 发送 CLIENT_READY + reconnect: true
+});
+```
+
+**关键点**：`setChannelState('CONNECTED')` 时 **不会** 自动把 `isPendingRevision` 设为 false。这是刻意的设计——因为服务端还没开始补发变更，此时如果允许提交，`baseRev` 还是断线前的旧版本，会造成版本错乱。
+
+`setIsPendingRevision` 函数的注释（[collab_client.ts L454-L457](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/collab_client.ts#L454-L457)）明确说明了这一点：
+
+```typescript
+// After reconnect, once all pending revisions from the server have been applied
+// (isPendingRevision transitions from true to false), flush any unsent local changes
+// that were queued while disconnected. The handleUserChanges() call in setChannelState
+// (CONNECTED) is not sufficient because isPendingRevision is still true at that point.
+```
+
+翻译：**重连后，必须等服务端补发的所有版本都应用完（isPendingRevision 从 true 变 false），才能提交本地累积的变更。在 setChannelState('CONNECTED') 时调用 handleUserChanges() 是不够的，因为此时 isPendingRevision 还是 true，会被门禁 5 拦住。**
+
+---
+
+**`setStateIdle` 的完整作用**（[collab_client.ts L445-L479](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/collab_client.ts#L445-L479)）：
+
+```typescript
+const setStateIdle = () => {
+  committing = false;  // 重置提交中标志
+  callbacks.onInternalAction('newlyIdle');
+  schedulePerhapsCallIdleFuncs();  // 执行 idleFuncs 队列
+};
+
+const schedulePerhapsCallIdleFuncs = () => {
+  setTimeout(() => {
+    if (!committing) {
+      while (idleFuncs.length > 0) {
+        const f = idleFuncs.shift();
+        f();  // 执行所有等待"不处于提交中"状态的函数
+      }
+    }
+  }, 0);
+};
+```
+
+`idleFuncs` 队列用于存放"必须等当前提交完成后才能执行"的操作（比如某些需要修改文档但又不能和提交冲突的插件操作）。断线时必须把这些函数执行掉，否则它们会一直等一个永远不会到来的 `acceptCommit`。
+
+---
+
+**完整置位时机总结**：
+
+只要 Socket.io 出现以下任何一种情况，`isPendingRevision` 就被设为 true：
+1. `disconnect` 事件（连接断开）
+2. `reconnect_attempt` 事件（开始尝试重连）
+3. `error` 事件（连接异常）
+
+这是一个极其保守的策略——**宁可暂时不提交，也不在版本可能不一致的情况下提交**。
 
 ---
 
@@ -744,6 +863,74 @@ const setIsPendingRevision = (value) => {
 ```
 
 这个轮询存在的意义是**防止 `setIsPendingRevision(false)` 因异常未被调用**（例如网络异常导致最后一条 `CLIENT_RECONNECT` 丢失）。如果一切正常，这个轮询永远不会触发到实际的提交——因为边沿触发会先一步调用 `handleUserChanges`。轮询只是双保险。
+
+---
+
+#### 完整状态机转换图（`isPendingRevision` + `channelState` 双状态协同）
+
+```
+                        ┌──────────────────────────────────────────────────────────────┐
+                        │  正常连接状态（isPendingRevision=false, channelState=CONNECTED） │
+                        │  - 用户输入 → handleUserChanges → 门禁5通过 → 提交成功       │
+                        │  - 收到 NEW_CHANGES → 正常应用                          │
+                        └──────────────┬───────────────────────────────────────────┘
+                                       │
+                                       ▼  Socket.io disconnect / error / reconnect_attempt
+                        ┌──────────────────────────────────────────────────────────────┐
+                        │  断线/重连状态（isPendingRevision=true, channelState=RECONNECTING） │
+                        │  ★ pad.ts 显式调用 setIsPendingRevision(true)               │
+                        │  - 用户输入 → DOM正常渲染 → ChangesetTracker 累积             │
+                        │  - handleUserChanges → 门禁5拦截 → 3s兜底轮询              │
+                        │  - 收到 NEW_CHANGES → 继续拦截（通过 serverMessageTaskQueue） │
+                        └──────────────┬───────────────────────────────────────────┘
+                                       │
+                                       ▼  收到最后一条 CLIENT_RECONNECT
+                                       │  (newRev === headRev) or (noChanges: true)
+                        ┌──────────────────────────────────────────────────────────────┐
+                        │  恢复转换中（isPendingRevision 从 true→false 的边沿瞬间）     │
+                        │  ★ 仅在这个边沿，setIsPendingRevision 自动调用 handleUserChanges() │
+                        │  - 把累积了整个断线期间的 userChangeset 整体合并提交               │
+                        └──────────────┬───────────────────────────────────────────┘
+                                       │
+                                       ▼
+                        ┌──────────────────────────────────────────────────────────────┐
+                        │  恢复正常（isPendingRevision=false, channelState=CONNECTED） │
+                        │  回到正常连接状态，继续正常协作                              │
+                        └──────────────────────────────────────────────────────────────┘
+```
+
+**状态转换的关键不变量**（任何时刻必须满足）：
+- `isPendingRevision=true` → `handleUserChanges` 门禁5 **一定** 拦截提交
+- `isPendingRevision=false` → `handleUserChanges` 门禁5 **一定** 允许提交（其他门禁可能拦截）
+- `isPendingRevision` 从 true→false 的 **边沿** → **自动触发** `handleUserChanges` 一次
+- `isPendingRevision` 从 false→true 的 **边沿** → **不触发** 任何操作
+
+**为什么要让 pad.ts 显式调用 setIsPendingRevision，而不是在 setChannelState 内部自动设置？**
+
+这是一个重要的设计选择：
+1. **关注点分离**：`collab_client.ts` 只负责协作逻辑（提交、去抖、版本管理），不直接监听 Socket.io 事件
+2. **灵活控制**：`pad.ts` 作为上层协调者，根据不同的 Socket.io 事件（disconnect / reconnect_attempt / error）决定何时进入拦截模式
+3. **避免误触发**：如果在 setChannelState 内部自动设置，可能会在正常连接建立时（如初次握手过程中）误拦截
+4. **显式优于隐式**：调用点明确写在事件处理函数中，代码可读性更好
+
+---
+
+#### 重连恢复完整时序示例
+
+假设用户 A 在编辑过程中断线 10 秒，期间输入了 3 个字符 "abc"，然后重连成功：
+
+| 时间 | 事件 | 状态 | 操作 |
+|------|------|------|------|
+| T=0 | 用户正常输入 "h" | `isPendingRevision=false` | 500ms 后提交 rev=100 → ACCEPT_COMMIT → rev=100 |
+| T=1 | 网络波动，Socket.io 触发 disconnect | `isPendingRevision=true`（pad.ts 调用 setIsPendingRevision(true)） | 进入拦截模式 |
+| T=2 | 用户输入 "a" | `isPendingRevision=true` | DOM 渲染 "a"，ChangesetTracker 累积，handleUserChanges 被门禁5 拦截 |
+| T=5 | 用户输入 "b" | `isPendingRevision=true` | DOM 渲染 "b"，累积到 userChangeset |
+| T=10 | Socket.io 重连成功，发送 CLIENT_READY + reconnect=true | `isPendingRevision=true` | 服务端开始补发 CLIENT_RECONNECT |
+| T=10.1 | 收到 CLIENT_RECONNECT rev=101（别人的变更） | `isPendingRevision=true` | 应用变更，newRev=101, headRev=102 → 继续等待 |
+| T=10.2 | 收到 CLIENT_RECONNECT rev=102（别人的变更） | `isPendingRevision=true` | 应用变更，newRev=102, headRev=102 → ★ 调用 setIsPendingRevision(false) |
+| T=10.2 | 边沿触发（true→false） | `isPendingRevision=false` | 自动调用 handleUserChanges，门禁5 通过 |
+| T=10.2 | 提交 "abc" 到服务端 | `isPendingRevision=false` | 发送 USER_CHANGES baseRev=102 |
+| T=10.3 | 收到 ACCEPT_COMMIT rev=103 | `isPendingRevision=false` | 确认成功，rev=103 |
 
 ---
 
