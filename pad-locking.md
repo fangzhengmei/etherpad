@@ -12,9 +12,9 @@ Etherpad 的并发编辑并不依赖数据库事务或悲观行锁,而是由三�
 
 ## 一、锁粒度:per-pad 的 Promise 链串行队列
 
-### 1.1 设计选择:粒度是"整个 pad",不是"用户"或"行段"
+### 1.1 设计选择:粒度是"整个 pad",但只覆盖协作编辑的用户变更
 
-Etherpad 没有按字符区间或行加锁,而是把**对同一个 pad 的所有写操作串行化**。这把"并发编辑"问题降维成"对 pad 的单写者"问题——只要一次只有一个 changeset 在被处理,后续到达的 changeset 看到的就一定是已被前者更新过的 head 版本,从而把"脏写"(基于过期版本的写)变成可被 OT 修正的"过期基线",而不是真正冲突的覆盖写。
+Etherpad 没有按字符区间或行加锁,也**没有对 pad 的所有写操作加锁**。它串行化的只是**来自协作编辑通道(socket.io `USER_CHANGES` 消息)的用户变更**——把对同一个 pad 的所有 USER_CHANGES 按到达顺序排队,一个接一个处理。这把"多用户并发编辑"降维成"对 pad 的单写者 OT 重基线"问题:只要一次只有一个 changeset 在被处理,后续到达的 changeset 看到的就一定是已被前者更新过的 head 版本,从而把"脏写"(基于过期版本的写)变成可被 OT 修正的"过期基线",而不是真正冲突的覆盖写。
 
 实现是一个极简的 `Channels` 类,见 [Channels 类定义](src/node/handler/PadMessageHandler.ts#L171-L202):
 
@@ -46,9 +46,26 @@ class Channels {
 - **`.catch(() => {})` 防止毒队列**:任意一个 changeset 处理失败被 reject,都会被吞掉,从而不会卡死后续任务——这一点对"冲突回滚"至关重要(见第三节):被拒绝的 changeset 决不能让整条 pad 队列停摆。
 - **空闲清理**:链尾 `.then` 里检查"是否仍是自己",是则 `delete`,避免 Map 无限增长。
 
-### 1.2 为什么只串行 USER_CHANGES
+### 1.2 串行化的适用范围:只覆盖协作编辑消息,不覆盖旁路写入
 
-注意 `handleMessage` 的分发:只有 `COLLABROOM` 下的 `USER_CHANGES` 走 [padChannels.enqueue](src/node/handler/PadMessageHandler.ts#L576-L579)。`USERINFO_UPDATE`、`CHAT_MESSAGE` 等不进队列——它们不触碰 pad 文本与版本号,没有脏写风险,串行它们只会徒增延迟。这体现了"锁只覆盖真正会竞争的资源"的粒度原则。
+`padChannels` 这个 per-pad 队列**只服务于一条写入路径**:`handleMessage` → `COLLABROOM` → `USER_CHANGES` → [padChannels.enqueue](src/node/handler/PadMessageHandler.ts#L576-L579) → `handleUserChanges`。
+
+以下写入路径都**绕过** `padChannels` 队列,直接调用 `Pad` 的方法落库:
+
+- **HTTP API**:
+  - `setText` —— 见 [API.setText](src/node/db/API.ts#L232-L243),直接 `pad.setText(text, authorId)`。
+  - `appendText` —— 见 [API.appendText](src/node/db/API.ts#L265),直接 `pad.appendText(text, authorId)`。
+  - `setHTML` —— 见 [API.setHTML](src/node/db/API.ts#L315-L333),走 `importHtml.setPadHTML(pad, html, authorId)`,内部最终也是 `appendRevision`。
+  - `restoreRevision` —— 见 [API.restoreRevision](src/node/db/API.ts#L599-L670),构建历史版本对应的正向 changeset 后 `pad.appendRevision` 落库。
+  - `copyPad` / `copyPadWithoutHistory` —— 复制 pad 时直接写入目标 pad。
+- **文件导入**:`ImportHandler` 在导入 etherpad / 文本 / DOCX 等文件后,直接调用 pad 方法写入,见 [ImportHandler](src/node/handler/ImportHandler.ts#L190)。
+- **插件与服务端内部路径**:任何直接 `require('ep_etherpad-lite/node/db/Pad')` 然后调 `pad.appendRevision` / `pad.setText` / `pad.spliceText` 的代码,都不经过 `padChannels`。
+
+`USERINFO_UPDATE`、`CHAT_MESSAGE`、`SAVE_REVISION` 等协作文档内的其他消息也不进队列——它们要么不改 pad 文本,要么改的是附属数据(聊天记录/保存标记),没有与 OT 竞争的脏写风险,串行它们只会徒增延迟。
+
+**为什么这些旁路不进队列?** 设计上 `padChannels` 的职责是"保证协作编辑的 OT 串行重基线有序进行",而不是"保护 pad 所有写入的一致性"。旁路写入通常由管理操作、批量操作、外部集成触发,频率远低于用户逐字输入,它们的并发模型不同——走队列反而会在有大量协作编辑时阻塞管理操作。
+
+但代价是:**旁路写入与协作编辑并发时,存在竞态窗口**(详见 1.5 节)。
 
 ### 1.3 进程内锁的边界(重要前提)
 
@@ -70,11 +87,46 @@ sendMessage(stateMessage);
 
 此外,客户端用一个 [serverMessageTaskQueue](src/static/js/collab_client.ts#L187-L200) 把服务端回推的 `NEW_CHANGES`/`ACCEPT_COMMIT` 串行化(同样的 Promise 链手法),避免 DOM 应用顺序错乱。
 
+### 1.5 旁路写入的客户端通知与并发竞态
+
+#### 旁路写入后如何通知客户端刷新
+
+所有标准旁路写入在落库后,都会调用 `padMessageHandler.updatePadClients(pad)` 把新版本推给在线客户端,让客户端刷新到最新 head。例如:
+
+- `API.setText` → `await padMessageHandler.updatePadClients(pad)`,见 [API.ts#L242](src/node/db/API.ts#L242)
+- `API.setHTML` → `padMessageHandler.updatePadClients(pad)`,见 [API.ts#L332](src/node/db/API.ts#L332)
+- `API.restoreRevision` → `await padMessageHandler.updatePadClients(pad)`,见 [API.ts#L670](src/node/db/API.ts#L670)
+- `ImportHandler` 导入完成后 → `padMessageHandler.updatePadClients(reloaded)`,见 [ImportHandler.ts#L190](src/node/handler/ImportHandler.ts#L190)
+
+`updatePadClients` 的实现见 [updatePadClients](src/node/handler/PadMessageHandler.ts#L1008-L1066)。逻辑是:
+
+1. 拿到该 pad 的所有 socket(`_getRoomSockets(pad.id)`);
+2. 对每个 socket,从它自己的 `sessioninfo.rev` 开始,循环到当前 head;
+3. 每版构造一条 `NEW_CHANGES` 消息发给客户端;
+4. 逐条推进 `sessioninfo.rev` 和 `sessioninfo.time`。
+
+消息格式与 USER_CHANGES 路径的广播完全一致,都是 `COLLABROOM.NEW_CHANGES`,客户端用同样的 client 侧 `serverMessageTaskQueue` 里串行应用。所以对客户端来说,"旁路写入"和"另一个用户的编辑"在接收端是同一条消息通道。
+
+#### 并发竞态:旁路写入与协作编辑同时发生时会怎样
+
+由于旁路写入不进 `padChannels`,因此它和正在处理中的 USER_CHANGES 之间**没有串行化保证**。Node.js 单线程保证了同步代码的原子性,但 `appendRevision` 是 async 函数——内部有 `await this.db.set(...)` 等异步点。如果:
+
+- 一个 USER_CHANGES 走到一半(已计算 atext,head 已 ++,但 db.set 还在 await 中);
+- 这时一个 setText API 调用并发进入,也调了 `appendRevision`;
+
+那么两个调用会**各自计算 changeset → copyAText → ++head → 落库**。结果是:后完成的那一份会覆盖先完成前一份的结果,这是一种真正的脏写。
+
+实践中这种情况发生率较低,因为:
+- 旁路写入频率远低于协作编辑频率;
+- 单进程内 async 函数的 await 挂起点在大多数时候错开;
+
+但这是设计上的明确取舍:`padChannels` 只保护协作编辑这条高频路径,不追求全量写入一致性。如果业务上需要保证并发安全,需要调用方自己加锁或排队。
+
 ---
 
 ## 二、操作变换串行化:把"过期基线"rebase 到 head
 
-锁保证了"同一 pad 内 changeset 依次处理",但**依次处理 ≠ 版本相同**:客户端发出的 changeset 是基于它本地记录的 `baseRev`,等它排到队首被处理时,服务端 head 可能已经被前面的同事推进了好几版。这时不能直接套用,必须用 OT 把它"重基线"到最新版本。这一段是整个脏写防护里最绕的部分。
+`padChannels` 保证了"同一 pad 内 USER_CHANGES 依次处理",但**依次处理 ≠ 版本相同**:客户端发出的 changeset 是基于它本地记录的 `baseRev`,等它排到队首被处理时,服务端 head 可能已经被前面的同事推进了好几版。这时不能直接套用,必须用 OT 把它"重基线"到最新版本。这一段是整个脏写防护里最绕的部分。
 
 入口在 [handleUserChanges](src/node/handler/PadMessageHandler.ts#L819-L1006)。串行化的核心是下面这个 while 循环,见 [OT rebase 循环](src/node/handler/PadMessageHandler.ts#L939-L951):
 
@@ -185,22 +237,48 @@ catch 块见 [冲突处理](src/node/handler/PadMessageHandler.ts#L998-L1002):
 
 一句话总结:**锁把并发变成串行,OT 把串行后的过期基线纠正到当前版本,校验先于提交则保证纠正不了的脏写被整体拒之门外而不留痕迹**。三者缺一:没有锁,OT 要处理真正的并发覆盖;没有 OT,串行也救不了过期基线;没有校验先于提交,畸形 changeset 就会污染 pad 的版本链与文本。
 
+> 以上协同路径**只适用于协作编辑的 USER_CHANGES 消息**。HTTP API、文件导入、插件直接调用 pad 方法等旁路写入,既不进 `padChannels` 队列,也不经过 OT rebase 和作者属性校验,直接 `appendRevision` 落库,再由 `updatePadClients` 把 NEW_CHANGES 推给在线客户端。旁路写入与协作编辑并发时存在竞态窗口,实践中靠"旁路频率低 + async 挂起点多错开"来降低概率,但设计上不保证严格互斥。如果业务场景需要所有写入都串行,调用方需自行加锁。
+
 ---
 
 ## 附:关键代码索引
+
+### 锁粒度与串行化
 
 | 机制 | 位置 |
 | --- | --- |
 | per-pad 串行队列 `Channels` | [PadMessageHandler.ts#L171-L202](src/node/handler/PadMessageHandler.ts#L171-L202) |
 | USER_CHANGES 入队(锁的入口) | [PadMessageHandler.ts#L576-L579](src/node/handler/PadMessageHandler.ts#L576-L579) |
+| 客户端 committing 状态机 | [collab_client.ts#L112-L148](src/static/js/collab_client.ts#L112-L148) |
+| 客户端 serverMessageTaskQueue | [collab_client.ts#L187-L200](src/static/js/collab_client.ts#L187-L200) |
+
+### 协作编辑写入路径
+
+| 机制 | 位置 |
+| --- | --- |
 | handleUserChanges 主体 | [PadMessageHandler.ts#L819-L1006](src/node/handler/PadMessageHandler.ts#L819-L1006) |
 | OT rebase 循环 | [PadMessageHandler.ts#L939-L951](src/node/handler/PadMessageHandler.ts#L939-L951) |
 | follow(OT 变换算子) | [Changeset.ts#L1446](src/static/js/Changeset.ts#L1446) |
 | identity(空 changeset) | [Changeset.ts#L809](src/static/js/Changeset.ts#L809) |
 | 尾换行不变量校验 | [PadMessageHandler.ts#L969-L975](src/node/handler/PadMessageHandler.ts#L969-L975) |
 | appendRevision(幂等落库) | [Pad.ts#L280-L335](src/node/db/Pad.ts#L280-L335) |
+
+### 旁路写入与客户端通知
+
+| 机制 | 位置 |
+| --- | --- |
+| API.setText(旁路入口) | [API.ts#L232-L243](src/node/db/API.ts#L232-L243) |
+| API.setHTML(旁路入口) | [API.ts#L315-L333](src/node/db/API.ts#L315-L333) |
+| API.restoreRevision(旁路入口) | [API.ts#L599-L670](src/node/db/API.ts#L599-L670) |
+| Pad.setText / spliceText(落库方法) | [Pad.ts#L475-L524](src/node/db/Pad.ts#L475-L524) |
+| updatePadClients(旁路后推给客户端) | [PadMessageHandler.ts#L1008-L1066](src/node/handler/PadMessageHandler.ts#L1008-L1066) |
+| 导入后的 updatePadClients 调用 | [ImportHandler.ts#L190](src/node/handler/ImportHandler.ts#L190) |
+
+### 冲突回滚
+
+| 机制 | 位置 |
+| --- | --- |
 | badChangeset 拒绝 | [PadMessageHandler.ts#L998-L1002](src/node/handler/PadMessageHandler.ts#L998-L1002) |
 | 客户端 disconnect 分支 | [pad.ts#L478-L483](src/static/js/pad.ts#L478-L483) |
-| 客户端 committing 状态机 | [collab_client.ts#L112-L148](src/static/js/collab_client.ts#L112-L148) |
 | inverse(逆 changeset,时间轴) | [PadMessageHandler.ts#L1586-L1600](src/node/handler/PadMessageHandler.ts#L1586-L1600) |
 | restoreRevision(历史回退) | [API.ts#L599](src/node/db/API.ts#L599) |
