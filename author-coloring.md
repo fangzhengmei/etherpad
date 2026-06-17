@@ -361,6 +361,87 @@ exports.checkAccess = async (padID, sessionCookie, token, userSettings) => {
   │────────────────────────────────▶ │──────────▶ 其他客户端更新颜色显示
 ```
 
+### 4.7 每条消息前的逐次校验与 authorID 变更拒绝机制
+
+**关键点**：`checkAccess` **不是只在 CLIENT_READY 时调用一次，而是在每条 Socket.IO 消息到达时都重新执行**。
+
+[handleMessage](file:///d:/fz/0601-2/solo-dogfeeding/code/23-etherpad-lite/src/node/handler/PadMessageHandler.ts#L377-L614) 的整体执行流程：
+
+```
+消息到达 (任何类型: CLIENT_READY / USER_CHANGES / USERINFO_UPDATE / CHAT_MESSAGE 等)
+  │
+  ├─ 1. 速率限制 (rateLimiter.consume)
+  ├─ 2. sessioninfos[socket.id] 存在性校验
+  │
+  ├─ 3. CLIENT_READY 特殊处理 (首次进入)
+  │     ├─ 从 Cookie 头解析 token + sessionID (HttpOnly, GDPR PR3)
+  │     ├─ 保存到 thisSession.auth = {sessionID, padID, token}
+  │     └─ 解析 readOnly / 真实 padId
+  │
+  ├─ 4. Object.defineProperty(message, 'padId') 拦截访问 (防止漏洞)
+  │
+  ├─ 5. 确认 thisSession.auth 已存在 (即必须先通过 CLIENT_READY)
+  │     └─ 无 auth → 抛 pre-CLIENT_READY message 错误
+  │
+  ├─ 6. ★ 每条消息都调用 securityManager.checkAccess() ★
+  │     ├─ padID + sessionCookie + token + req.session.user
+  │     ├─ findAuthorID() → now < validUntil 实时校验会话是否过期
+  │     └─ 返回 {accessStatus, authorID}
+  │
+  ├─ 7. accessStatus !== 'grant' → 发 {accessStatus} → 抛 'access denied'
+  │
+  ├─ 8. ★ authorID 变化检测 (颜色归属防篡改核心) ★
+  │     if (thisSession.author != null
+  │         && thisSession.author !== authorID) {
+  │       socket.emit('message', {disconnect: 'rejected'});
+  │       throw new Error('Author ID changed mid-session...');
+  │     }
+  │
+  ├─ 9. 首次连接: thisSession.author = authorID  (写入内存快照)
+  │
+  ├─ 10. handleMessageSecurity 钩子 → 可临时解除只读限制
+  ├─ 11. handleMessage 钩子 → 插件可拦截
+  │
+  └─ 12. switch(type) 分发到具体处理器:
+          CLIENT_READY → handleClientReady
+          USER_CHANGES → padChannels.enqueue → handleUserChanges
+          USERINFO_UPDATE → handleUserInfoUpdate
+          CHAT_MESSAGE → handleChatMessage
+          ...
+```
+
+**核心防线：authorID 变化拒绝（L510-L521）**
+
+```typescript
+if (thisSession.author != null && thisSession.author !== authorID) {
+  socket.emit('message', {disconnect: 'rejected'});
+  throw new Error([
+    'Author ID changed mid-session. Bad or missing token or sessionID?',
+    `socket:${socket.id}`,
+    `IP:${logIp(socket.request.ip)}`,
+    `originalAuthorID:${thisSession.author}`,   // 连接初始时的颜色归属
+    `newAuthorID:${authorID}`,                  // 本次 checkAccess 算出的归属
+    ...(user && user.username) ? [`username:${user.username}`] : [],
+    `message:${message}`,
+  ].join(' '));
+}
+```
+
+#### 4.7.1 三种触发 authorID 变化的场景
+
+| 场景 | originalAuthor | newAuthor | 触发 disconnect:rejected？ |
+|------|---------------|-----------|------------------------|
+| **HTTP API 会话过期，token 对应另一位作者** | `a.sessionAuthor`（来自 createSession） | `a.tokenAuthor`（浏览器 token 对应） | ✅ 是，立即断开 |
+| **会话被管理员 API 主动 deleteSession 删除** | `a.sessionAuthor` | `a.tokenAuthor`（降级到 token） | ✅ 是，下一条消息就断开 |
+| **会话过期，但 token 恰对应同一作者** | `a.abc123` | `a.abc123` | ❌ 不变，允许继续 |
+| **requireSession=true，会话过期** | `a.sessionAuthor` | DENY（无降级） | 先走 access denied，不会走到比较 |
+
+**对颜色身份的直接影响**：
+- 一旦触发 `disconnect: 'rejected'`，客户端 Socket 连接被服务端强制关闭
+- 客户端必须重新走完整的 Pad 页面加载 → Socket 重连 → 新一轮 CLIENT_READY
+- 若此时会话已过期且 requireSession=false → 新连接获得 `a.tokenAuthor` 的颜色身份，**用户可能看到自己的颜色突然变了**
+- 若 requireSession=true → 无法重连，提示需要重新登录/授权
+
 ---
 
 ## 5. 会话生命周期 (Session Lifecycle)
