@@ -171,7 +171,7 @@ const setChangeCallbackTimeout = () => {
 
 **作用**：同一事件循环内的多次 DOM 变更合并为一次变更通知，避免高频触发。
 
-#### 第二层：CollabClient 的提交延迟（commitDelay）
+#### 第二层：CollabClient 的提交延迟（commitDelay）+ 六段式状态门禁
 
 **文件**：[collab_client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/collab_client.ts#L49)
 
@@ -179,41 +179,156 @@ const setChangeCallbackTimeout = () => {
 let commitDelay = 500; // 默认 500ms 提交延迟
 ```
 
-**核心逻辑**：`handleUserChanges` 函数
+**核心逻辑**：`handleUserChanges` 函数——**六段式提前终止**
+
+`handleUserChanges` 是客户端推送变更的唯一入口，进入后按顺序做 6 个门禁检查，每个检查不通过就**提前 return**，并根据情况安排下次重试。完整代码在 [collab_client.ts L95-L158](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/collab_client.ts#L95-L158)。
+
+---
+
+**门禁 1：输入法合成中（InInternationalComposition）**
 
 ```typescript
-// collab_client.ts L95-L158
-const handleUserChanges = () => {
-  const now = Date.now();
-  
-  // ... 状态检查（连接中、提交中等）
-  
-  // 计算最早可提交时间
-  const earliestCommit = lastCommitTime + commitDelay;
-  if (now < earliestCommit) {
-    setTimeout(handleUserChanges, earliestCommit - now);
-    return; // 还没到提交时间，延后再试
-  }
-
-  // 没有待处理的服务端变更时才提交
-  if (!isPendingRevision) {
-    const userChangesData = prepareUserChangeset();
-    if (userChangesData.changeset) {
-      lastCommitTime = now;
-      committing = true;
-      stateMessage = {
-        type: 'USER_CHANGES',
-        baseRev: rev,
-        changeset: userChangesData.changeset,
-        apool: userChangesData.apool,
-      };
-      sendMessage(stateMessage); // 发送到服务端
-    }
-  }
-};
+if (editor.getInInternationalComposition()) {
+  // handleUserChanges() will be called again once composition ends
+  // so there's no need to set up a future call before returning.
+  return;
+}
 ```
 
-**去抖效果**：
+| 项目 | 说明 |
+|------|------|
+| **触发条件** | 用户正在使用中文/日文等输入法输入复合字符（compositionstart 已触发但 compositionend 尚未触发） |
+| **后续处理** | **不设 setTimeout**——直接 return。因为 compositionend 事件触发后会重新走 DOM 变更检测流程，自动再次调用 `handleUserChanges` |
+| **深层机制** | 输入法合成期间，浏览器 DOM 处于不稳定状态（中间态字符、下划线标记等）。如果此时提交 Changeset，会把合成的中间态（如拼音字母）也发送出去，造成文档污染 |
+| **实现细节** | `inInternationalComposition` 是一个 **Promise** 而不是布尔值。见 [ace2_inner.ts L3589-L3597](file:///d:/fz/0601-2/solo-dogfeeding/code/8-etherpad-lite/src/static/js/ace2_inner.ts#L3589-L3597)，`compositionstart` 时创建 Promise，`compositionend` 时 resolve。这样既可以用 `if(x)` 判断状态，又能用 `await x` 等待合成结束 |
+
+```typescript
+// ace2_inner.ts L3391-L3597
+let inInternationalComposition = null;
+
+$(targetDoc.documentElement).on('compositionstart', () => {
+  if (inInternationalComposition) return;
+  inInternationalComposition = new Promise((resolve) => {
+    $(targetDoc.documentElement).one('compositionend', () => {
+      inInternationalComposition = null;
+      resolve();
+    });
+  });
+});
+```
+
+---
+
+**门禁 2：连接未建立或正在连接中**
+
+```typescript
+const now = Date.now();
+if ((!getSocket()) || channelState === 'CONNECTING') {
+  if (channelState === 'CONNECTING' && (now - initialStartConnectTime) > 20000) {
+    setChannelState('DISCONNECTED', 'initsocketfail');
+  } else {
+    setTimeout(handleUserChanges, 1000); // 1秒后重试
+  }
+  return;
+}
+```
+
+| 项目 | 说明 |
+|------|------|
+| **触发条件** | Socket 对象不存在，或连接状态是 `CONNECTING`（握手尚未完成） |
+| **超时判定** | `initialStartConnectTime` 在 `setUpSocket()` 中设置（见 L175），如果连接过程超过 **20 秒**，判定为网络故障，进入 `DISCONNECTED` 状态 |
+| **重试策略** | 未超时的话，**每 1000ms** 重试一次 `handleUserChanges`。这是一个相对宽松的轮询周期，因为连接建立本身是异步事件驱动的，轮询只是兜底 |
+| **用户体验** | 此期间用户可以继续在本地输入，DOM 变更会被 ChangesetTracker 正常捕获，只是不会提交到服务端 |
+
+---
+
+**门禁 3：提交过慢（上一次提交长期未确认）**
+
+```typescript
+if (committing) {
+  if (now - lastCommitTime > 20000) {
+    setChannelState('DISCONNECTED', 'slowcommit');
+  } else if (now - lastCommitTime > 5000) {
+    callbacks.onConnectionTrouble('SLOW'); // 触发 UI 提示"连接缓慢"
+  } else {
+    setTimeout(handleUserChanges, 3000); // 3秒后重试
+  }
+  return;
+}
+```
+
+| 项目 | 说明 |
+|------|------|
+| **触发条件** | `committing = true`（上一次 `USER_CHANGES` 已发送，但尚未收到 `ACCEPT_COMMIT` 响应） |
+| **三级判定** |<ul><li>**< 5 秒**：正常情况，3 秒后再查一次（看是否收到确认）</li><li>**5~20 秒**：触发 `onConnectionTrouble('SLOW')`，UI 显示"网络缓慢"提示</li><li>**> 20 秒**：判定为提交丢失或服务端故障，进入 `DISCONNECTED` 状态，由 Socket.io 自动重连机制接手</li></ul> |
+| **commit 期间的本地变更** | 用户继续输入会被 ChangesetTracker 累积到 `userChangeset`（和上一次提交的变更自动 compose 合并），等 `acceptCommit()` 被调用后会一并提交 |
+| **提交确认的作用链** | `ACCEPT_COMMIT` → `acceptCommit()` → `setStateIdle()`（`committing = false`） → 立即调用 `handleUserChanges()` 提交累积的新变更 |
+
+---
+
+**门禁 4：去抖窗口内（距离上次提交不足 500ms）**
+
+```typescript
+const earliestCommit = lastCommitTime + commitDelay;
+if (now < earliestCommit) {
+  setTimeout(handleUserChanges, earliestCommit - now);
+  return;
+}
+```
+
+| 项目 | 说明 |
+|------|------|
+| **触发条件** | `now < lastCommitTime + 500ms` —— 距离上次成功提交还不到 500ms |
+| **精确调度** | 不是固定延迟，而是精确计算**还需要等多少毫秒**才到最早提交时间（`earliestCommit - now`），到期立刻执行 |
+| **设计考量** |<ul><li>500ms 是人眼感知"实时"的心理阈值</li><li>合并快速连续输入（比如打字速度 400 字符/分钟，500ms 内会有 3~4 个按键事件）</li><li>减少服务端处理压力和网络带宽</li></ul> |
+| **与 committing 的配合** | 注意：这个门禁在 `committing` 门禁**之后**。也就是说，即使 500ms 到了，如果上一次提交还没确认，也不会触发新的提交。必须同时满足"committing = false"且"距上次提交 > 500ms" |
+
+---
+
+**门禁 5：有待处理的服务端版本（isPendingRevision）**
+
+```typescript
+let sentMessage = false;
+if (!isPendingRevision) {
+  const userChangesData = prepareUserChangeset();
+  if (userChangesData.changeset) {
+    // ... 真正执行提交 ...
+    sendMessage(stateMessage);
+    sentMessage = true;
+  }
+} else {
+  setTimeout(handleUserChanges, 3000); // 3秒后重试
+}
+```
+
+| 项目 | 说明 |
+|------|------|
+| **触发条件** | `isPendingRevision = true`——正在接收服务端补发的批量变更（断线重连时），或有 NEW_CHANGES 消息队列待处理 |
+| **为什么必须拦截** | 如果在服务端版本尚未全部补齐的情况下提交本地变更，会导致 `baseRev` 不正确，服务端 Rebase 时出现版本错乱（Changeset 的偏移计算会错位） |
+| **恢复时机** | 见下方「断线后本地新输入拦截与恢复」一节的详细分析 |
+| **重试周期** | 3 秒一次，周期较长，因为重连补版本通常是秒级完成的，这个轮询只是兜底（正常情况下是由 `setIsPendingRevision(false)` 主动触发提交） |
+
+---
+
+**门禁 6：无实际变更（userChangesData.changeset 为空）**
+
+这不是显式的 if-return，而是隐含在流程中。当 `prepareUserChangeset()` 返回的 `changeset` 为空（或为恒等 Changeset）时，不会执行 `sendMessage`，`sentMessage` 保持为 `false`，后面也就不会安排 3 秒后的超时检测。
+
+**六个门禁之后的正常提交流程**：
+
+```typescript
+lastCommitTime = now;        // 记录提交时间（用于门禁4的去抖计算）
+committing = true;           // 设置提交中标志（门禁3的判断条件）
+stateMessage = { ... };      // 保存提交内容（用于断线后 getMissedChanges 重放）
+sendMessage(stateMessage);   // 实际发送 USER_CHANGES
+sentMessage = true;
+// ...
+if (sentMessage) {
+  setTimeout(handleUserChanges, 3000); // 3秒后再次检查（用于超时检测，见门禁3）
+}
+```
+
+**去抖效果总结**：
 - 连续输入时，每 500ms 才提交一次 Changeset
 - 提交期间（`committing = true`）的新变更会累积，等待下一次提交
 - 减少网络请求次数，合并多次小变更
