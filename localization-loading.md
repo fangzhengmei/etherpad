@@ -425,7 +425,7 @@ if (this.loader!.langs.has(lang)) {
 
 这意味着即使 `loader.langs` 中没有 `de-AT` 的独立翻译包，只要有 `de` 的包，`de-AT` 的翻译仍能以 `de` 的内容作为回退，且 `this.language` 会被设为 `'de'` 而非 `'de-AT'`。
 
-注意：此回退**不检查** `loader.langs.has(loaderLang)`，如果主标签也不存在，会在 `loader.langs.get(undefined)` 上抛出异常。但由于 `localize()` 已经把主标签追加到了数组中，`Loader.load` 会保证主标签已加载，因此此分支在正常使用中不会触发异常。
+注意：此回退**不检查** `loader.langs.has(loaderLang)`，如果主标签也不存在，`loader.langs.get(undefined)` 返回 `undefined`，但 `for (let string in undefined)` 在 JavaScript 中是**静默 no-op**（既不执行循环体，也不抛出异常），`this.language` 仍会被设为 `loaderLang`（如 `'de'`），只是没有任何翻译条目被写入 `build` Map。正常使用下 `localize()` 已把主标签追加到数组中并保证加载，因此此分支极少触发。
 
 ---
 
