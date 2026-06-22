@@ -916,3 +916,188 @@ ACCEPT_COMMIT 之所以可以宽容，是因为**它不承载外部文档内容*
 #### 对重连时序的影响
 
 正因为 ACCEPT_COMMIT 的宽松，在"CLIENT_RECONNECT 里已经 acceptCommit 推了 rev → 旧 ACCEPT_COMMIT 到达"的交织场景下不会误报，rev 保持不变即可。这是整个重连系统能稳定运行而不被乱序打断的关键细节之一。
+
+---
+
+## 十二、五处补充细节校正
+
+### 12.1 强制重连表单与 missedChanges：到底走哪条服务端路径
+
+上一版文档里有一处推断错误——我假设 `pad.forceReconnect()` → `form#reconnectform.submit()` → `POST /ep/pad/reconnect` 是主路径。对照代码发现真实情况更反直觉：
+
+#### 两条完全分叉的路径
+
+| 触发方式 | 代码位置 | 实际行为 |
+|----------|---------|---------|
+| **路径 A（占 100% 实际触发）** | [pad_connectionstatus.ts:35-37](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad_connectionstatus.ts#L35-L37) | `$('button#forcereconnect').on('click', () => window.location.reload())` ——**直接刷新页面** |
+| **路径 B（死代码路径）** | [pad.ts:1065-1072](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad.ts#L1065-L1072) `pad.forceReconnect()` | 填三个 hidden input（padId / diagnosticInfo / missedChanges）→ `form.trigger('submit')` POST `/ep/pad/reconnect` |
+
+在整个 src 目录里 grep `pad.forceReconnect` / `.forceReconnect(` **没有任何调用方**。它是暴露在 pad 命名空间里的外部 API（可能给插件用），但默认 UI 的"手动重新连接"按钮和倒计时触发的 `forceReconnection($modal)` [pad_automatic_reconnect.ts:100-102](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad_automatic_reconnect.ts#L100-L102) 走的是 `#forcereconnect` 的 click → 直接 `location.reload()`。
+
+#### 服务端 `/ep/pad/reconnect` 路由：根本不存在
+
+在所有 `expressCreateServer` hook 里搜索不到对 `/ep/pad/reconnect` 的 `app.post` 注册。`tests/backend/specs/urlBasePath.ts` 只断言 HTML 模板里的 `action="/ep/pad/reconnect"` 字符串存在，并不断言这个路由实际返回 200。
+
+#### missedChanges 的真实去向：丢失（但影响面小）
+
+因为路径 A 是纯刷新，`getMissedChanges()` 里辛苦打包的 `{userInfo, baseRev, committedChangeset, furtherChangeset, ...}`（[collab_client.ts:428-443](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L428-L443)）**根本不会送到服务端**。表单 input 被填充了但从不被提交。
+
+这意味着：当走强制重连（`slowcommit` / `initsocketfail` / 用户手动点按钮）时，**本地未发编辑会丢失**。用户界面用 gritter "There are unsaved changes." 提示过，但实际数据没被抢救回来——路径 B 的 `missedChanges` 抢救机制从未真正跑通过。这是一个设计上的"半截"：前端表单和 getMissedChanges 都写了，但后端路由没接上（或历史上被移除了），只剩 UI 提示。
+
+#### 历史推断
+
+从 HTML 模板同时存在 `form#reconnectform` 和按钮 click 直接 reload 来看，更可能的演进是：早期版本确实走表单 POST → 后端重放 missedChanges → 重定向回 pad；后来为了简化，改成直接 reload，但旧表单和 `pad.forceReconnect()` API 被作为兼容层保留下来，无人调用。
+
+### 12.2 prepareUserChangeset：为什么要清作者归属再重新赋值
+
+之前没提这一步——它在 OT 对齐里极其关键。代码在 [changesettracker.ts:142-163](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/changesettracker.ts#L142-L163)，只在 **`submittedChangeset` 为空**的分支执行（有 submittedChangeset 时直接 `compose(submitted, userChangeset)`，因为 submitted 已经是清洗过的作者归属）：
+
+```
+L142  const authorId = window.pad.myUserInfo.userId;
+L145  // Sanitize authorship: Replace all author attributes with this user's author ID in case the
+L146  // text was copied from another author.
+L147  const cs = unpack(userChangeset);
+L148  const assem = new MergingOpAssembler();
+L150  for (const op of deserializeOps(cs.ops)) {
+L151    if (op.opcode === '+') {                 // 只处理插入操作
+L152      const attribs = AttributeMap.fromString(op.attribs, apool);
+L153      const oldAuthorId = attribs.get('author');
+L154      if (oldAuthorId != null && oldAuthorId !== authorId) {
+L155        attribs.set('author', authorId);    // 强制替换成当前用户
+L156        op.attribs = attribs.toString();
+L157      }
+L158    }
+L159    assem.append(op);
+L160  }
+L162  userChangeset = pack(cs.oldLen, cs.newLen, assem.toString(), cs.charBank);
+```
+
+#### 为什么必须做这一步
+
+典型场景：用户在浏览器里从别人写的段落里**复制粘贴一段带属性的文本**到自己正在编辑的位置。粘贴产生的 DOM mutation 会被 ACE 层捕获为 changeset，里面的 `+` op 带的 `author` 属性仍然是原作者的（因为 DOM 里每个 span 的 data-author 保留了来源）。
+
+如果不清洗直接发送：
+1. 服务端会认为这段文本是原作者插入的
+2. 作者归属表、贡献统计、光标颜色全部错乱
+3. 更糟糕的是，这条 changeset 带着别人的 author 属性被应用到 baseAText 后，下次我再编辑时，作者归属会从"我"跳回"别人"，导致撤销栈混乱
+
+因此 prepareUserChangeset 在发送前**对所有插入操作强制将 author 属性改写成 `myUserInfo.userId`**，确保"从这台浏览器发出的改动 100% 归属于当前用户"，而不管 DOM mutation 里带的来源作者是谁。
+
+注意：Keep（`=`）和 Delete（`-`）op 不处理——它们不产生新文本，不涉及作者归属。同时用 `MergingOpAssembler` 重打包，把相邻同属性的 op 合并回去，降低 changeset 体积。
+
+### 12.3 follow 的 reverseInsertOrder：并发插入的光标偏好映射
+
+在八章里我只提到"reverseInsertOrder 解决对称性破缺"，但它的真实语义和"用户光标位置"强绑定。先看 `follow` 的定义签名 [Changeset.ts:1446](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/Changeset.ts#L1446)：
+
+```
+follow(cs1, cs2, reverseInsertOrder, pool)
+  · cs1 和 cs2 都基于同一 oldLen（并发）
+  · 返回：把 cs2 变换到 cs1 执行后的新文档坐标
+  · reverseInsertOrder === false → cs1 的插入排在 cs2 之前（cs1 被视为"更先发生"）
+  · reverseInsertOrder === true  → cs2 的插入排在 cs1 之前（cs2 被视为"更先发生"）
+```
+
+在 [changesettracker.ts:99-132](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/changesettracker.ts#L99-L132) 的 applyChangesToBase 里，两处 follow 的参数是**严格对称但相反**的：
+
+| 位置 | 调用 | reverseInsertOrder | 语义 |
+|------|------|--------------------|------|
+| L113 | `follow(c, oldSubmitted, false, apool)` | false | 外部变更 c 优先插入（我的旧提交在外部之后） |
+| L114 | `follow(oldSubmitted, c, true, apool)` | true | 同上（反向表达），得到 c2 等价外部 c |
+| L119 | `follow(c2, oldUserChangeset, true, apool)` | **true** | 我的本地打字 userChangeset **优先插入** |
+| L121 | `follow(oldUserChangeset, c2, false, apool)` | **false** | 同上反向，得到 postChange |
+
+L117 有注释 `preferInsertingAfterUserChanges = true`——意思就是：对 userChangeset（用户正在光标处输入的字）来说，**如果外部变更和我在同一位置插入，要把我的字放在前面**。这样用户的光标不会跳到插入内容后面，不会"打字时光标被别人的字推着走"。
+
+反过来，submittedChangeset（已经发出去的提交）被视为"已经离开这台浏览器"，外部变更 c 的插入要排在前面——因为那份 changeset 已经不在本地控制了，交给服务端的全局序裁决，本地只需做被动 OT 变换。
+
+#### `insertorder=first` 属性的额外层级
+
+`follow` 内部 [Changeset.ts:1459-1489](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/Changeset.ts#L1459-L1489) 还有一层优先级：若 cs1 或 cs2 的插入 op 带 `['insertorder', 'first']` 属性（Etherpad 里按 Ctrl+Enter 换行等特殊操作会带这个），则不管 reverseInsertOrder，带这个属性的那份优先插入。这保证了"特殊换行"等操作在并发时不会被挤错位置。
+
+### 12.4 重连复用首屏 clientVars：对齐窗口在哪
+
+温合重连（socket.io reconnect）不会让浏览器重新渲染 HTML，所以 `window.clientVars`（首屏注入的那个大对象）原封不动保留在内存里。这带来一个有趣的"对齐窗口"问题：重连时服务端**不会重新下发 CLIENT_VARS**，而客户端所有初始化都基于首屏的那份，两者可能相差几百条 revision。
+
+#### 代码层面的证据
+
+**客户端侧**——[pad.ts:353-379](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad.ts#L353-L379)：
+```
+handshake():
+  let receivedClientVars = false;   // L354
+  ...
+  socket.io.on('connect', () => {
+    // 首次连接 receivedClientVars=false, 走 isReconnect=false
+    // reconnect 事件 receivedClientVars=true, 走 isReconnect=true
+    sendClientReady(receivedClientVars);   // L378
+  });
+  ...
+  socket.on('message'):
+    if (!receivedClientVars && obj.type === 'CLIENT_VARS') {
+      receivedClientVars = true;           // L462 —— 仅首次置 true
+      ... init collabClient using obj.data.collab_client_vars ...
+    }
+```
+
+**服务端侧**——[PadMessageHandler.ts:1208-1210](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1208-L1210)：
+```
+if (message.reconnect) {
+  // If this is a reconnect, we don't have to send the client the ClientVars again
+  socket.join(sessionInfo.padId);
+  ... 只发 CLIENT_RECONNECT 补历史修订 ...
+} else {
+  // first connect — 拉 atext、apool、作者、插件等组装完整 CLIENT_VARS 下发
+}
+```
+
+#### 对齐窗口的含义与边界
+
+首屏 `clientVars.collab_client_vars` 里包含：`initialAttributedText`（首屏 pad 文本快照）、`rev`（快照对应的修订号）、`apool`（首屏属性池）、历史作者信息等。重连时：
+
+1. `initialAttributedText` 和 `rev` —— 不重要。collabClient 内部的 `baseAText` 和 `rev` 已经在用户在线编辑期间持续被 `applyChangesToBase` / `acceptCommit` 推进到当下值，首屏快照早就不用了。
+2. `apool` —— **关键**。客户端本地 apool 是首屏池 + 每次 NEW_CHANGES / prepareUserChangeset 增量添加。重连后，CLIENT_RECONNECT 每条消息都会附带消息内 changeset 用到的精简 apool，并通过 `moveOpsToNewPool()`（11.2 节）把引用编号翻译到本地池，所以不会冲突。
+3. 作者颜色、用户名、插件配置等静态元数据 —— 重连时如果服务端这些值变了（比如管理员改了用户颜色），客户端不会更新。这是已知的对齐窗口限制，但这些元数据改变频度极低，下次全页刷新就会自然同步。
+
+所以"对齐窗口"就是：首屏 clientVars 是重连时的**只读基准元数据**，所有动态状态（文本、rev、属性映射）都已经由客户端自己的协作循环推进了，服务端只需补 CLIENT_RECONNECT 修订历史，无需重新下发整份 CLIENT_VARS——这是温合重连能在几百毫秒内恢复的核心优化。
+
+### 12.5 自动重连的一次性 latch：`socket.once('connect')`
+
+在强制重连倒计时过期时，代码 [pad_automatic_reconnect.ts:87-98](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad_automatic_reconnect.ts#L87-L98) 有个容易被忽略的分支：
+
+```
+waitUntilClientCanConnectToServerAndThen(callback, pad):
+  whenConnectionIsRestablishedWithServer(callback, pad);
+  pad.socket.connect();   // 主动触发 socket.io 发起连接
+
+whenConnectionIsRestablishedWithServer(callback, pad):
+  // only add listener for the first try, don't need to add another listener
+  // on every unsuccessful try
+  if (reconnectionTries.counter === 1) {
+    pad.socket.once('connect', callback);    // 一次性 latch
+  }
+```
+
+#### 为什么是 `counter === 1`
+
+`reconnectionTries.counter` 是指数退避计时器的全局变量：
+- 第一次倒计时结束 → `counter = 1` → 注册 `socket.once('connect', callback)`，并立即 `pad.socket.connect()`
+- 第二次（翻倍等待后）→ `counter = 2` → 不重复注册，因为第一次注册的 `once` 监听器**还在**（除非第一次 connect 已经成功触发过）
+
+这是个一次性 latch（门锁）：只在第一次倒计时结束时注册一个 `connect` 回调，后续每轮倒计时只是 `pad.socket.connect()` 让底层再试一次，而 callback 只等**第一次成功 connect** 触发。
+
+#### 这个 callback 是什么
+
+往上追溯 [pad_automatic_reconnect.ts:59-65](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad_automatic_reconnect.ts#L59-L65)，onExpire 的 callback 是 `() => forceReconnection($modal)`。因此整条链路：
+
+```
+倒计时到 0
+  → 若 counter===1：注册 socket.once('connect', () => forceReconnection($modal))
+  → 调 pad.socket.connect()
+  → 若 connect 成功：callback 触发 → $('#forcereconnect').click() → location.reload()
+  → 若 connect 失败：socket.io 内部指数退避继续试，下一轮倒计时结束又调一次 pad.socket.connect()
+```
+
+#### 设计意图
+
+**避免重复 reload**：如果不做 latch，每一轮倒计时都注册一个新的 `once('connect')` → 某次 connect 成功时 N 个回调同时触发 → N 次 reload 狂刷页面。counter===1 的条件保证全页面生命周期内最多只注册一个一次性监听器，成功时只触发一次 forceReconnection。
+
+但这里也有个隐藏的"死锁"边界：如果 counter 被加到 2 以上（意味着至少一轮 connect 失败），然后用户手动把网线插上，socket.io 自动 connect 成功，但 latch 监听器在 counter=1 时就注册过了，仍然会正常触发 forceReconnection —— 因为 `once` 只会触发一次，和 counter 的当前值无关。所以最终效果是对的：只要任何一次 connect 成功，就会立即 reload 页面，用户不需要等到下一次倒计时。
