@@ -1418,3 +1418,210 @@ unset 状态
    document.documentElement.className   // 看当前实际生效的 variant class
    document.querySelectorAll('meta[name="theme-color"]')  // 看输出了几个 meta
    ```
+
+---
+
+## 十二、pad / timeslider / index 三个模板的横向对比
+
+三个 EJS 模板在主题装配系统里的参与度呈阶梯式下降：**pad.html（全功能）→ timeslider.html（阉割版）→ index.html（完全不参与）**。下面从结构、代码分支、DOM、localStorage 读写四个维度逐一切片对比。
+
+### 12.1 三个模板的结构与主题相关代码位置总览
+
+| | [pad.html](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html) | [timeslider.html](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/timeslider.html) | [index.html](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/index.html) |
+|---|---|---|---|
+| **文件总行数** | 710 行 | 309 行 | 252 行 |
+| **`<head>` 内 EJS 脚本** | L1-L20（含 `skinColors` require + `configuredColor/darkColor` 计算） | L1-L11（同 pad，变量名 `themeColor/darkThemeColor`） | L1-L6（**不 require skinColors，无颜色计算**） |
+| **`<html>` class** | `pad <插件名> <skinVariants>` | `pad <skinVariants>`（无插件名） | **无任何主题 class**（只有 lang/dir） |
+| **theme-color meta** | L57-L58（亮 + 可选暗） | L45-L46（同 pad） | **不存在** |
+| **内联防白闪 IIFE** | L61-L87（可选，依赖 `darkColor`） | L48-L68（同 pad，依赖 `darkThemeColor`） | **不存在** |
+| **核心 CSS 加载** | L90：`/static/css/pad.css` + L93：`/static/skins/<name>/pad.css` | L70-L74：多了 `iframe_editor.css`、`timeslider.css`，另加 `timeslider.css` skin 文件 | L19-L155：**内嵌硬编码的 `<style>` 块（约 130 行）**，只额外加载 L157：`/static/skins/<name>/index.css` |
+| **Dark Mode checkbox DOM** | L303-L306：`#theme-toggle-row[hidden]` + `#options-darkmode` | **不存在**（#settings 弹窗里只有 font/speed/linenos） | **不存在** |
+| **Skin Variants Builder** | L658-L687：`<div id="skin-variants">`（`if (settings.skinName == 'colibris')` 守卫） | **不存在** | **不存在** |
+| **客户端 JS Bundle** | L702：`padBootstrap-xxx.min.js`（entrypoint） + L705：`skins/<name>/pad.js` | L306：`timeSliderBootstrap-xxx.min.js` + L303：`skins/<name>/timeslider.js` | L246：`indexBootstrap-xxx.min.js` + L249：`skins/<name>/index.js` |
+| **`<body>` 整体布局** | 完整编辑器框架：toolbar + editorcontainer + 10 个弹窗（settings/import-export/connectivity/users/chat/skin-variants 等） | 时间轴专用：toolbar + outerdocbody + 3 个弹窗（settings/import-export/connectivity） | 极简首页：wrapper + 一个表单 + 一个 settings-dialog |
+
+### 12.2 主题相关代码分支启用矩阵（逐模板逐观测点）
+
+下面按 §11.1 的 4 个观测节点 T1~T4，对比三模板在 ep_darkMode 三态下哪些分支启用、哪些跳过。前提：`skinName=colibris`, `enableDarkMode=true`（即最完整的环境）。
+
+#### T1：服务端 EJS 渲染时的分支
+
+| 代码分支 | pad.html | timeslider.html | index.html |
+|---|---|---|---|
+| `require('ep_etherpad-lite/node/utils/SkinColors')` | ✅ L4 | ✅ L3 | ❌ 不存在 |
+| `configuredToolbarColor(skinName, skinVariants)` | ✅ L18 → 存 `configuredColor` | ✅ L7 → 存 `themeColor` | ❌ 不调用 |
+| `enableDarkMode ? darkToolbarColor(...) : null` | ✅ L19 → 存 `darkColor` | ✅ L10 → 存 `darkThemeColor` | ❌ 不调用 |
+| `<html class="... <skinVariants>"` | ✅ L22 | ✅ L13 | ❌ L8：`<html lang="..." dir="...">` 无主题 class |
+| 亮 `theme-color` meta（`if (configuredColor)`） | ✅ L57：带条件 media | ✅ L45：带条件 media | ❌ 无 |
+| 暗 `theme-color` meta（`if (darkColor)`） | ✅ L58：输出 | ✅ L46：输出 | ❌ 无 |
+| 内联 IIFE（`if (darkColor)`） | ✅ L61-L87：输出 | ✅ L48-L68：输出 | ❌ 无 |
+| Skin Variants Builder DOM（`if (skinName == 'colibris')`） | ✅ L658-L687：输出 | ❌ 根本没这 DOM | ❌ 无 |
+| `#theme-toggle-row` checkbox DOM | ✅ L303-L306：默认 `hidden` | ❌ #settings 弹窗无此元素 | ❌ 无 |
+
+**结论**：T1 阶段 index.html 完全脱离主题系统，timeslider 和 pad 基本等价，只有 checkbox 和 Skin Builder 的差异。
+
+#### T2：内联 IIFE 中的 localStorage 判断
+
+| IIFE 内代码行 | pad.html | timeslider.html | index.html |
+|---|---|---|---|
+| IIFE 存在的前提 | `darkColor != null`（即 colibris + enableDarkMode=true） | 同 pad（`darkThemeColor != null`） | ❌ IIFE 不存在 |
+| `hash === '#skinvariantsbuilder' → return` | ✅ L73 | ✅ L54 | ❌ 无 |
+| `localStorage.getItem('ep_darkMode') === 'false' → return` | ✅ L74 | ✅ L55 | ❌ 无 |
+| `matchMedia(dark).matches` 检查 | ✅ L75-L76 | ✅ L56-L57 | ❌ 无 |
+| remove 12 个旧 variant class + add 暗 3 个 class | ✅ L77-L83 | ✅ L58-L64 | ❌ 无 |
+| 全部包在 `try/catch`（localStorage/matchMedia 不可用降级） | ✅ L70/L84 | ✅ L52/L65 | ❌ 无 |
+
+**localStorage 三态在 T2 的表现（仅 pad 和 timeslider，且前提 colibris+enableDarkMode=true）**：
+
+| `ep_darkMode` 值 | pad/timeslider 行为 |
+|---|---|
+| `null`（unset） | `'false'` 判断为 false → 不 return → 通过 matchMedia → 系统暗则切暗 |
+| `"true"` | 同上（`=== 'false'` 为 false）→ 系统暗则切暗 |
+| `"false"` | `=== 'false'` 为 true → **立即 return** → 保持服务端写入的亮配色 |
+
+index.html 在 T2 **无任何行为**，IIFE 压根不存在。
+
+#### T3：客户端 init 阶段（pad.ts / timeslider 对应 JS）
+
+| 行为 | pad 页（pad.ts） | timeslider 页（timeSliderBootstrap） | index 页（indexBootstrap） |
+|---|---|---|---|
+| 是否存在 enableDarkMode 相关自动切暗逻辑 | ✅ [pad.ts#L764-L766](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L764-L766) | **需要验证**：timeslider 的 entrypoint 不在 pad.ts 中，而是 timeSliderBootstrap | indexBootstrap 完全无关 |
+| `isWhiteModeEnabledInLocalStorage()` 调用 | ✅ pad.ts#L764 作为第四个条件 | — | — |
+| 显示 Dark Mode checkbox（`#theme-toggle-row`） | ✅ [pad.ts#L767-L770](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L767-L770) | ❌ DOM 不存在，无相关代码 | ❌ 无 |
+| checkbox checked 状态来自 `isDarkMode()`（读 DOM class） | ✅ pad.ts#L769 | ❌ 无 | ❌ 无 |
+| DOM class 同步到 iframe 层（ace_outer / ace_inner / history-frame） | ✅ `updateSkinVariantsClasses` 推 3~6 层 DOM | timeslider 是单文档，不涉及 iframe 嵌套 | ❌ 无 |
+
+**localStorage 三态在 T3 的表现**：
+
+| `ep_darkMode` 值 | pad 页（enableDarkMode=true） | timeslider | index |
+|---|---|---|---|
+| `null`（unset） | `isWhiteModeEnabledInLocalStorage()` → false → 条件通过 → matchMedia(dark) 则切暗 | 取决于 timeSliderBootstrap 是否镜像实现 | ❌ 无 |
+| `"true"` | 同上（`!== 'false'`）→ matchMedia(dark) 则切暗 | 同上 | ❌ 无 |
+| `"false"` | `isWhiteModeEnabledInLocalStorage()` → true → `!true` → 条件短路 → 保持亮 | 同上逻辑（若实现） | ❌ 无 |
+
+#### T4：用户手动交互
+
+| 行为 | pad 页 | timeslider | index |
+|---|---|---|---|
+| Dark Mode checkbox DOM 存在 | ✅ `#options-darkmode`（设置弹窗内） | ❌ 不存在 | ❌ 不存在 |
+| 事件绑定（`bindCheckboxChange`） | ✅ [pad_editor.ts#L140-L150](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad_editor.ts#L140-L150) | ❌ 无元素 → 无绑定 | ❌ 无 |
+| `setDarkModeInLocalStorage(true/false)` 写入 | ✅ pad_editor.ts#L142 | ❌ 无 | ❌ 无 |
+| `updateSkinVariantsClasses(dark/light classes)` 切换 | ✅ pad_editor.ts#L144-L148 | ❌ 无 | ❌ 无 |
+| Skin Variants Builder 弹窗交互 | ✅ `#skinvariantsbuilder` hash → 显示弹窗 + 下拉框 change 事件 → 实时改 class | ❌ 无 DOM | ❌ 无 |
+
+**localStorage 三态在 T4 的表现**：
+
+| `ep_darkMode` 值 | pad 页 | timeslider | index |
+|---|---|---|---|
+| `null`（unset） | 用户点 checkbox → 首次写入 `"true"` 或 `"false"`，永久离开 unset | ❌ 无交互 | ❌ 无 |
+| `"true"` | 点 checkbox 取消 → 写 `"false"`，DOM 立刻改亮 + meta 同步 | ❌ 无 | ❌ 无 |
+| `"false"` | 点 checkbox 勾选 → 写 `"true"`，DOM 立刻改暗 + meta 同步 | ❌ 无 | ❌ 无 |
+
+**关键事实**：T4 是**唯一能让 localStorage 从 unset 变成有值**的阶段，而且一写入就**永远回不到 unset**（没有任何 `removeItem` 调用）。只有 pad 页支持这个交互，timeslider 和 index 完全不碰。
+
+### 12.3 localStorage 读写点的跨页面覆盖
+
+整个代码库中 `localStorage.ep_darkMode` 的所有读写点以及它们在三个页面是否生效：
+
+| 读写点 | pad 页 | timeslider | index |
+|---|---|---|---|
+| 【读】内联 IIFE：`getItem === 'false'`（T2） | ✅ 生效（如果 darkColor != null） | ✅ 生效（如果 darkThemeColor != null） | ❌ 代码不存在 |
+| 【读】`isWhiteModeEnabledInLocalStorage()`（T3，pad.ts） | ✅ 生效 | ❌ 代码不在 timeslider bootstrap | ❌ 代码不在 index bootstrap |
+| 【读】`isDarkModeEnabledInLocalStorage()`（`=== 'true'`） | ❌ 导出但零调用 | ❌ 零调用 | ❌ 零调用 |
+| 【写】`setDarkModeInLocalStorage()`（T4，pad_editor.ts） | ✅ 生效（用户点 checkbox） | ❌ DOM 不存在无法触发 | ❌ DOM 不存在无法触发 |
+| 【间接读】`isDarkMode()`（读 DOM class，不直接读 localStorage） | ✅ 生效（T3 checkbox checked 判断 + T4 切换） | ❌ 无 checkbox | ❌ 无 |
+
+**最核心的不对称**：
+
+1. **写入点只在 pad 页**（timeslider 和 index 没有任何路径能写 ep_darkMode）
+2. **读取点在 pad + timeslider 都有**（两者的内联 IIFE 都会读）
+3. **index 完全不参与读写**
+
+导致一个可观测现象：**用户在 pad 页勾选了 Dark Mode（写 `ep_darkMode="true"`），然后跳转到 `/p/:pad/timeslider` 查看历史——timeslider 页的内联 IIFE 会读到这个 localStorage 值**。如果值是 `"false"`（用户显式取消勾选），timeslider 页会跳过自动切暗；如果是 `"true"` 或 unset，跟随系统。**这是三个页面之间唯一通过 localStorage 产生的主题联动**。
+
+### 12.4 DOM 与 localStorage 的对应关系
+
+按"localStorage 值 → 实际 DOM 状态"来列，前提：`skinName=colibris`, `enableDarkMode=true`, 系统暗色：
+
+| `localStorage.ep_darkMode` | pad 页最终 DOM | timeslider 页最终 DOM | index 页最终 DOM |
+|---|---|---|---|
+| `null`（unset） | `<html class="pad ... super-dark-editor dark-background super-dark-toolbar">`<br>theme-color：双 meta，可能被 JS 覆盖内容 | 同 pad（无 checkbox 但 IIFE 生效） | `<html lang="..." dir="...">`（无主题 class，theme-color，无 meta） |
+| `"true"` | 同上（`"true"` 和 unset 行为完全一样） | 同上 | 同上（完全不读） |
+| `"false"` | `<html class="pad ... super-light-toolbar super-light-editor light-background">`<br>checkbox 未 checked<br>theme-color：双 meta，但 JS 会把两个 content 都改成 `#ffffff` | 同 pad（保持亮，IIFE return 早） | 同上（完全不读） |
+
+按"页面 → localStorage 值"反向看（即刷新后哪个 localStorage 值让哪个页面呈现什么状态）：
+
+| 页面 | localStorage 值对它有没有影响 | 影响通过什么代码 |
+|---|---|---|
+| **pad** | ✅ 完整影响（T2+T3+T4 全链路） | 内联 IIFE + pad.ts 自动切暗 + pad_editor.ts checkbox |
+| **timeslider** | ✅ 影响 T2（IIFE）和 T3（如果有 mirror 实现），但**不能写** | 只有内联 IIFE（L55）；无法通过 checkbox 写入，必须由 pad 页先写入 |
+| **index** | ❌ 零影响 | 不读不写，完全无关 |
+
+### 12.5 为什么 index.html 完全不参与主题系统
+
+对比三个模板的设计意图就能理解：
+
+- **pad.html**：是编辑器主界面——用户会长时间停留，有工具栏、设置面板、Skin Builder 调试工具，必须支持完整的主题切换和 Dark Mode 自动适配
+- **timeslider.html**：是查看历史的时间轴页面——用户会短暂停留，有工具条配色一致性需求（所以有 theme-color + IIFE + skinVariants class），但没有设置面板（不需要让用户在时间轴页切主题）
+- **index.html**：是首页/入口页——用户通常几秒就跳走，用内嵌的硬编码 CSS（index.html#L19-L155 整整 130+ 行 inline style）保证"开箱即用"，不依赖皮肤系统，也不考虑 Dark Mode 自动切换
+
+实际上 index.html 里的主题唯一可定制点是 L157 的 `/static/skins/<skinName>/index.css`——自定义皮肤可以在自己的 `index.css` 里覆盖首页样式，但**不存在任何运行时切换机制**（因为没有 JS 逻辑去改 class 或读 localStorage）。
+
+### 12.6 跨页面跳转的主题行为示例
+
+典型用户旅程：访问首页 → 进 pad → 切 Dark Mode → 进 timeslider 看历史：
+
+```
+① GET / （index.html）
+   └─ localStorage 无 ep_darkMode 键
+      → index.html 无 IIFE、无 theme-color、无 skinVariants class
+      → 用内嵌 CSS + skins/colibris/index.css 渲染
+      → 视觉完全不读 localStorage
+
+② 用户点"新建 Pad"→ GET /p/test （pad.html，colibris + enableDarkMode=true，系统暗）
+   └─ T1：输出双 meta + IIFE + <html class="... super-light-toolbar ...">
+      T2：IIFE 执行：
+         localStorage.ep_darkMode = null
+         'false' 判断不命中 → 不 return
+         matchMedia(dark) = true
+         → <html> 被改成 super-dark-editor dark-background super-dark-toolbar
+      T3：pad.ts init：
+         enableDarkMode=true + matchMedia(dark) + isWhiteMode=false
+         → updateSkinVariantsClasses(dark classes) （同步到 iframe）
+         → #theme-toggle-row hidden=false，checkbox.checked = true
+      视觉：暗色，地址栏 #485365
+
+③ 用户打开设置，**取消**勾选 Dark Mode checkbox （T4）
+   └─ pad_editor.ts#L140 事件触发：
+      setDarkModeInLocalStorage(false) → localStorage.ep_darkMode = "false"
+      updateSkinVariantsClasses(light classes)
+        → 所有 DOM 根改成亮配色 class
+        → updateThemeColorMeta()：双 meta content 都改成 "#ffffff"
+
+④ 用户点"查看历史" → GET /p/test/timeslider （timeslider.html，系统暗）
+   └─ T1：输出双 meta + IIFE + <html class="pad ... super-light-toolbar ...">
+      T2：IIFE 执行：
+         localStorage.ep_darkMode = "false"  ←★ 读到了 pad 页写的值
+         'false' 判断命中 → **立即 return**
+         → 不切暗，保持服务端写入的亮配色 class
+      T3：timeSliderBootstrap init （无 checkbox）
+      视觉：亮色（虽然系统是暗，但 localStorage 显式"false"覆盖了）
+      关键：这是**三个页面之间唯一存在的主题状态传递**——通过 localStorage 共享
+```
+
+### 12.7 三模板主题功能汇总对比表
+
+| 主题功能 | pad | timeslider | index |
+|---|---|---|---|
+| 服务端 skinVariants class 写入 `<html>` | ✅ | ✅ | ❌ |
+| `<meta theme-color>` 输出（0/1/2 个） | ✅（由 SkinColors 决定） | ✅（同 pad） | ❌ |
+| 防白闪内联 IIFE（CSS 加载前切暗） | ✅（enableDarkMode && colibris） | ✅（同 pad） | ❌ |
+| localStorage 读取（`ep_darkMode === 'false'`） | ✅（T2 IIFE + T3 pad.ts） | ✅（T2 IIFE） | ❌ |
+| localStorage 写入（`setItem('ep_darkMode', ...)`） | ✅（T4 checkbox） | ❌ | ❌ |
+| Dark Mode 设置项 checkbox | ✅ | ❌ | ❌ |
+| 自动跟随系统 `prefers-color-scheme` | ✅ | ✅（IIFE 层） | ❌ |
+| 用户显式覆盖系统偏好为亮（localStorage `"false"`） | ✅ | ✅（通过 pad 页写入间接生效） | ❌ |
+| 用户显式覆盖系统偏好为暗（持久化） | ❌（仅本次会话，刷新后跟随系统） | ❌（同上） | ❌ |
+| Skin Variants Builder 调试弹窗 | ✅（仅 colibris） | ❌ | ❌ |
+| iframe 多层 DOM class 同步 | ✅（3~6 层） | ❌（单文档） | ❌ |
+| `<meta theme-color>` JS 运行时改写 | ✅（`updateThemeColorMeta`） | ❌（无 checkbox 触发） | ❌ |
