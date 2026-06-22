@@ -701,3 +701,218 @@ if (newRev !== (rev + 1)) {
 - 若真的是坏消息，后续要么 slowcommit 超时、要么用户手动 refresh，同样有兜底。
 
 这也是第七节时序图末尾提到的"出错时尽量保可用、不直接崩"设计哲学的一部分。
+
+---
+
+## 十一、五处代码细节深度校正
+
+### 11.1 endNum 钳制：为何"永远不触发"还写着
+
+在上一节 10.2.1 我曾解读为"await 期间 head 推进的防御"，但对照 [PadMessageHandler.ts:1222-1229](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1222-L1229) 的**同步执行上下文**，这其实是个有趣的历史遗留陷阱：
+
+```
+L1222  let startNum = message.client_rev! + 1;
+L1223  let endNum = pad.getHeadRevisionNumber() + 1;    // ① 第一次取 head
+L1224
+L1225  const headNum = pad.getHeadRevisionNumber();     // ② 紧接着第二次取 head
+L1226
+L1227  if (endNum > headNum + 1) {                      // ③ 钳制
+L1228    endNum = headNum + 1;
+L1229  }
+```
+
+关键：L1223 和 L1225 之间**没有 await、没有任何让出事件循环的调用**，在 Node.js 单线程模型下 pad 对象不会被改。因此对于任何一次 handleClientReady 调用，**endNum === headNum + 1 恒成立**，L1227 的判断恒为 false，钳制死代码。
+
+#### 真实意图
+
+结合 L1250-L1260 发送循环里每条消息单独取 `pad.getHeadRevisionNumber()` 作 `headRev` 的做法，可以还原这段的设计意图：
+
+1. **未来维护防御**：这段代码的结构是"先算边界 → 中间可能加 DB 操作 → 再验证边界"。如果未来有人在 L1224 插入了 `await`（例如加一段权限校验或 hook），钳制就会自动生效，避免 startNum 大于实际 head。
+
+2. **与发送循环 headRev 实时取法互补**：真正保护"逐条发消息期间 head 可能被并发推进"的其实是 L1254：
+   ```
+   for (const r of revisionsNeeded) {
+     wireMsg.data.headRev = pad.getHeadRevisionNumber();   // 每条单独取
+     socket.emit('message', wireMsg);
+   }
+   ```
+   每条消息带的 `headRev` 是当下的最新值，客户端解封条件是 `if (newRev === headRev)`。如果发消息期间又有新协作者推进了 3 条 revision，那么原来的最后一条 CLIENT_RECONNECT 的 `headRev` 已经是新值，客户端不会解封；紧接着广播的三条 NEW_CHANGES（走 room 广播）会由 NEW_CHANGES 分支 `rev++` 推进到新 head——但这里有个微妙的时序问题：CLIENT_RECONNECT 消息还在 `isPendingRevision=true` 期间发 NEW_CHANGES，两者的 serverMessageTaskQueue 会严格按到达顺序执行，所以最后到达的那一条 CLIENT_RECONNECT 不会解封（newRev < headRev），等 NEW_CHANGES 推到 head 后 NEW_CHANGES 分支本身也不会主动调用 `setIsPendingRevision(false)`。
+
+   这个"理论上的漏解封"实际上靠什么兜住？因为客户端在重连后第一个 CLIENT_READY 已经 join 回房间了，NEW_CHANGES 广播会同时到达。当客户端 NEW_CHANGES 分支推进 rev 到 headRev 时，虽然 NEW_CHANGES 分支不会 setIsPendingRevision(false)，但下一次 handleUserChanges 的发送分支会检查 `!isPendingRevision` 为 false 而继续 3s 轮询。因此只有两种结果：
+   - 如果 CLIENT_RECONNECT 的最后一条 headRev 与当时 NEW_CHANGES 的最后一条 newRev 重合，CLIENT_RECONNECT 会正常解封（发消息循环是同步的，而 NEW_CHANGES 要经过广播链路，会更晚到，所以通常 headRev ≤ 当时 CLIENT_RECONNECT 的 newRev）。
+   - 如果 CLIENT_RECONNECT 发送完之后才产生 NEW_CHANGES，那 NEW_CHANGES 会到达后 rev 推进，但此时 headRev 的比较已经做过了 → 客户端将永远停留在 isPendingRevision 直到 slowcommit 超时。这是一个已知的极小概率窗口，bug 表现为"重连后无法发送编辑"，需要用户手动刷新。
+
+结论：L1227-L1229 的钳制是**给未来维护者留的护栏**，不是当前代码路径会触发的分支。
+
+### 11.2 applyChangesToBase 前置 apool 翻译（moveOpsToNewPool）
+
+此前八章 8.2 节列了"六步调用链"，但漏掉了**真正的第 0 步**——属性池翻译。这是重连场景里极易搞错的前提。代码在 [changesettracker.ts:103-106](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/changesettracker.ts#L103-L106)：
+
+```
+if (apoolJsonObj) {
+  const wireApool = (new AttributePool()).fromJsonable(apoolJsonObj);
+  c = moveOpsToNewPool(c, wireApool, apool);
+}
+```
+
+#### 为什么必须翻译
+
+- 服务端和客户端**各自维护独立的 AttributePool**，属性编号（`*0`, `*1`, `*j`…）分配是局部自增的。服务端 `*0` 可能代表 `['bold', 'true']`，客户端 `*0` 可能代表 `['author', 'a.john']`，完全对不上。
+- 因此每条 NEW_CHANGES / CLIENT_RECONNECT 都附带一个"精简 apool"——只包含这条 changeset 真正用到的属性映射，格式是服务端当时的编号。
+- 客户端在 apply 之前必须把 changeset 里所有 `*<num>` 属性引用的编号**从 wireApool 坐标系改写到本地 apool 坐标系**，否则后续 follow() / compose() 里比较属性字符串或取属性值都会对到错误的键上，表现为加粗被当成加粗+红色，或者作者颜色丢失等鬼畜 bug。
+
+#### moveOpsToNewPool 实现细节
+
+定义在 [Changeset.ts:934-952](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/Changeset.ts#L934-L952)：
+
+```
+1. 找到第一个'$'分隔符（changeset 格式是 ops$charBank，属性引用只出现在 ops 部分）
+2. 对 ops 部分跑正则 /\*([0-9a-z]+)/g 抓所有属性编号
+3. 对每个编号：
+   · wireApool.getAttrib(oldNum) → 取出 [key, value]
+   · 若找不到 → return ''（该属性被丢弃，对应 timeslider 删除场景）
+   · apool.putAttrib(pair) → 在本地池子里创建/查询到新编号 newNum
+   · 用 '*' + numToString(newNum) 替换原来的引用
+4. charBank（$ 之后的原文）不动，因为它不含属性编号
+```
+
+所以八章 8.2 的"六步调用链"实际应为**七步**：在步骤 1 `applyToAText(c, baseAText)` 之前，必须先完成"0. 属性池坐标归一化"。属性池翻译是 OT 对齐能跑通的前提。
+
+### 11.3 串行队列只罩三类包，USER/CHAT 走内联：对重连时序的影响
+
+此前六章只说"消息进 queue"，但实际 `handleMessageFromServer` 里进 `serverMessageTaskQueue` 的只有**精确的三类**，其余全部同步处理。完整分区如下（对照 [collab_client.ts:209-323](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L209-L323)）：
+
+| 消息类型 | 是否进串行队列 | 处理位置 |
+|----------|---------------|---------|
+| NEW_CHANGES | ✅ 进 | L209-227：await 输入法合成 → 校验 rev → applyChangesToBase |
+| ACCEPT_COMMIT | ✅ 进 | L228-241：校验 rev → acceptCommit() |
+| CLIENT_RECONNECT | ✅ 进 | L242-267：按序补回历史，到达 headRev 解封闸门 |
+| USER_NEWINFO | ❌ 内联同步 | L268-278：直接写 userSet + 立即更新 ACE 作者颜色 |
+| USER_LEAVE | ❌ 内联同步 | L279-286：直接 delete userSet + 褪色 |
+| CLIENT_MESSAGE | ❌ 内联同步 | L287-288：直接 call onClientMessage 插件钩子 |
+| CHAT_MESSAGE | ❌ 内联同步 | L289-290：直接 addMessage 渲染到聊天框 |
+| CHAT_MESSAGES | ❌ 内联同步 | L291-310：批量加载历史聊天 |
+| `handleClientMessage_${type}` hook | ❌ 外于队列 | L323：**队列外同步触发**，哪怕该类型进了队列 |
+
+#### 对重连时序的具体影响
+
+这些"逃逸"的包会和队列里的三类包发生顺序交错，带来三个可见的用户体验后果：
+
+**1. "张三来了"比"张三写的字"先出现在屏幕上**
+
+用户列表更新（USER_NEWINFO）是同步的，而张三的编辑内容要等 CLIENT_RECONNECT 队列按序跑完。温和重连补回 100 条 revision 期间，用户列表先于正文更新，看起来像"人已经在那了但字还没浮现"。这是有意设计——元数据不影响协作正确性，提前显示降低用户困惑。
+
+**2. 聊天消息会穿插在补回的编辑中间**
+
+如果在重连期间有人在聊天窗发消息，CHAT_MESSAGE 同步执行，聊天框里会立刻看到。但同一位作者在同一时段写的正文还在 CLIENT_RECONNECT 队列里排队。不影响数据正确性，只是"聊天快、正文慢"。
+
+**3. handleClientMessage_NEW_CHANGES hook 先于 applyChangesToBase 执行**
+
+这是最容易坑插件作者的一条。由于 L323 在所有分支之后同步执行，而且 NEW_CHANGES 队列任务是 `.then()` 异步调度的，事件顺序为：
+
+```
+1. 收到 NEW_CHANGES → 同步入队（同步创建 promise，但 fn 还没跑）
+2. 同步走 L323 → hooks.callAll('handleClientMessage_NEW_CHANGES', ...)
+3. 下个微任务 → serverMessageTaskQueue 里的 fn() 才执行 → applyChangesToBase
+```
+
+因此插件 hook 如果读取 DOM，会发现"正文还是旧的，changeset 还没 apply"。正确做法是在 hook 里也 await 或者监听后续事件。这个时序陷阱同样适用于 ACCEPT_COMMIT 和 CLIENT_RECONNECT。
+
+### 11.4 stale tab 被踢 userdup：在 reconnect 入口之前执行
+
+上一节 10.2.3 讲了"异步等待期间断线"，但更常见的 stale tab（同浏览器同作者旧 tab）被踢的路径在更前面，且**对 reconnect 和首次连接都生效**。代码在 [PadMessageHandler.ts:1174-1197](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1174-L1197)：
+
+```
+位置：L1174-1197，在 handleClientReady 的 message.reconnect 判断（L1208）之前执行。
+```
+
+#### 踢人的精确条件
+
+同时满足**全部四条**才会触发：
+
+| 条件 | 代码位置 | 含义 |
+|------|---------|------|
+| ① `user == null` | L1181 | 未走认证：无 basic auth / 无 SSO / 无 getAuthorId 插件映射作者ID |
+| ② `!sessionInfo.embed` | L1181 + L1190 | 当前 socket 不是 iframe 内嵌的 timeslider 等嵌入场景 |
+| ③ room 中存在 otherSocket | L1180 + L1182 | pad 房间里还有别的连接 |
+| ④ otherSocket.author === 本 socket.author 且 `!sinfo.embed` | L1190 | 对方和我是同一作者（同一浏览器 cookie 派生 authorID），且对方也不是嵌入 |
+
+L1174-1179 整段长注释解释了设计：cookie 派生的 authorID 是**per-browser** 的，同浏览器开两个 tab 打开同一个 pad 会得到相同 author。历史上这一直是 stale tab 的来源——用户打开新 tab 编辑，但旧 tab 还挂着。两个 tab 都声称"我是 a.john"会导致协作状态错乱（双向提交会把自身 changeset 当成外部变更）。
+
+#### 执行顺序
+
+```
+handleClientReady 入口（L1128）
+  ↓
+L1137-L1165: await padManager.getPad()、拉取作者信息等（多个 await）
+  ↓
+L1170: sessionInfo 一致性检查（防止等 DB 期间断线）
+  ↓
+L1174-L1197: ★ 遍历 room 里同 author 的旧 socket，踢掉
+                · sessioninfos[otherSocket.id] = {}
+                · otherSocket.leave(padId)
+                · otherSocket.emit('message', {disconnect: 'userdup'})
+  ↓
+L1208: 分 message.reconnect ? 分支 : 首次连接分支
+```
+
+**关键点：reconnect 和首次连接都会走到这段踢人逻辑。** 温和重连场景下，如果旧 tab 在断线期间，用户在新 tab 里继续编辑（新 tab 进了房间），那么旧 tab 重连发送 CLIENT_READY + reconnect=true 时，就会在 L1174 被新 tab 的存在触发踢人——给旧 tab 发 userdup 断连，旧 tab 端编辑器禁用，用户需要关掉。反过来，如果旧 tab 先重连成功，用户在新 tab 点刷新，新 tab 的首次 CLIENT_READY 会把旧 tab 踢掉。
+
+#### 客户端 userdup 的处理
+
+在 [pad.ts:478-487](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad.ts#L478-L487)：
+```
+if (obj.disconnect) {
+  padconnectionstatus.disconnected(obj);
+  padeditor.ace.setEditable(false);
+}
+```
+`padconnectionstatus.disconnected('userdup')` 会在白名单里匹配到"重复会话 / 你在另一个标签页打开了同一文档"的文案。注意 userdup 路径**不会触发自动重连倒计时**（因为再连还会被踢，会陷入踢-连-踢循环）。
+
+#### 有认证用户不会被踢
+
+L1181 的 `if (user == null && !sessionInfo.embed)` 是关键开关。如果用户通过 basic auth / SSO 登录且配置了 `getAuthorId` hook 把 username 映射到稳定 authorID，那么 `req.session.user` 存在 → `user != null` → 跳过整段踢人逻辑。这样同一账号在两台设备上并发编辑是被允许的（此时 authorID 虽然相同但来自不同 socket，不构成 stale tab）。
+
+### 11.5 ACCEPT_COMMIT 放过 newRev===rev 与 NEW_CHANGES 严格 newRev===rev+1 的不对称意图
+
+此前二章只说了三处"都只 warn 不抛"，但其实校验的严格程度不对称，对照 [collab_client.ts:220,234,252](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L220-L252)：
+
+```
+NEW_CHANGES      :  if (newRev !== (rev + 1))       // 严格：必须 +1
+ACCEPT_COMMIT    :  if (![rev, rev + 1].includes(newRev))   // 宽松：等于 rev 也可以
+CLIENT_RECONNECT :  if (newRev !== (rev + 1))       // 严格：必须 +1
+```
+
+#### ACCEPT_COMMIT 为何允许相等
+
+代码里附了两行长注释（L231-233），完整覆盖三种场景：
+
+```
+// newRev will equal rev if the changeset has no net effect (identity changeset, removing
+// and re-adding the same characters with the same attributes, or retransmission of an
+// already applied changeset).
+```
+
+| 场景 | 发生时机 | newRev === rev 的理由 |
+|------|---------|---------------------|
+| ① identity changeset | 用户删除一段文本后立即原样粘回，且格式/属性完全一致 | 服务端合并结果文档没变化，rev 不增长（pad.appendRevision 内部会判空） |
+| ② 移除并重新添加相同字符+属性 | 敲"a"再删除"a"的来回两次操作被合并为最终 changeset 净效果为 0 | 同上，服务端最终 changeset 是 identity，rev 不长 |
+| ③ 重传已应用的 changeset | 重连时 CLIENT_RECONNECT 里作者是自己 → acceptCommit() 先把 rev 推了，旧的 ACCEPT_COMMIT 随后到达（socket 乱序）| rev 已被推到 newRev，所以相等 |
+
+第三种场景在重连里极其常见：客户端断线前发了一份 USER_CHANGES，服务端接受后本来要回 ACCEPT_COMMIT，但此时断了；重连恢复后，服务端用 CLIENT_RECONNECT 把这条 revision 补回来，客户端走"作者是自己"分支 acceptCommit() 把 rev 推上去；等旧的 ACCEPT_COMMIT 再到的时候 newRev 已经和 rev 相等。如果这时候严格判断，就会"明明成功了却警告 bad revision"。
+
+#### NEW_CHANGES / CLIENT_RECONNECT 为何严格 +1
+
+这两类消息的共同特征是**代表文档状态的新增外部修订**，每条 revision 都必须严格单调且无间隔地应用到 baseAText 上：
+
+- 如果 `newRev <= rev`：这是旧消息重播（或乱序到了），changeset.oldLen 和当前 baseAText 长度不匹配，直接 apply 会崩。跳过，让后续消息继续推进对齐。
+- 如果 `newRev > rev + 1`：中间漏了 revision，同样 changeset.oldLen 不是当前 baseAText 的长度，会崩。跳过，靠 CLIENT_RECONNECT 重新补回或后续消息重试兜。
+
+ACCEPT_COMMIT 之所以可以宽容，是因为**它不承载外部文档内容**——它只是告诉客户端"你发的那份我确认了"，真正把 changeset 合并进 baseAText 的是 `acceptCommit()` 里调的 `applyPreparedChangesetToBase()`，用的是客户端自己缓存的 submittedChangeset（肯定 oldLen 对得上），所以 ACCEPT_COMMIT 的 newRev 只做版本号推进，不参与 OT 计算。这就是不对称性的根本原因：
+
+- **NEW_CHANGES / CLIENT_RECONNECT**：changeset 来自外部，oldLen 依赖 rev 严格匹配，必须严格 newRev = rev+1。
+- **ACCEPT_COMMIT**：changeset 在客户端本地缓存（submittedChangeset），oldLen 永远对得上，newRev 只用来推进版本计数器，可以宽容 newRev ∈ {rev, rev+1}。
+
+#### 对重连时序的影响
+
+正因为 ACCEPT_COMMIT 的宽松，在"CLIENT_RECONNECT 里已经 acceptCommit 推了 rev → 旧 ACCEPT_COMMIT 到达"的交织场景下不会误报，rev 保持不变即可。这是整个重连系统能稳定运行而不被乱序打断的关键细节之一。
