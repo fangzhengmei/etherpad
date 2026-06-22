@@ -1101,3 +1101,195 @@ whenConnectionIsRestablishedWithServer(callback, pad):
 **避免重复 reload**：如果不做 latch，每一轮倒计时都注册一个新的 `once('connect')` → 某次 connect 成功时 N 个回调同时触发 → N 次 reload 狂刷页面。counter===1 的条件保证全页面生命周期内最多只注册一个一次性监听器，成功时只触发一次 forceReconnection。
 
 但这里也有个隐藏的"死锁"边界：如果 counter 被加到 2 以上（意味着至少一轮 connect 失败），然后用户手动把网线插上，socket.io 自动 connect 成功，但 latch 监听器在 counter=1 时就注册过了，仍然会正常触发 forceReconnection —— 因为 `once` 只会触发一次，和 counter 的当前值无关。所以最终效果是对的：只要任何一次 connect 成功，就会立即 reload 页面，用户不需要等到下一次倒计时。
+
+---
+
+## 十三、服务端重连 vs 首连：四处不对称细节
+
+### 13.1 socket.join 时序与 updatePadClients 兜底的不对称
+
+`handleClientReady` 函数（[PadMessageHandler.ts:1128-1509](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1128-L1509)）的两条分支在 join 时机和兜底策略上有显著差异：
+
+#### 首次连接（else 分支，L1270-1445）
+
+```
+顺序：
+  1. 准备 atext / apool / headRev / clientVars 大对象
+  2. 跑 clientVars hook（多次 await，可能耗时长）
+  3. socket.join(sessionInfo.padId)          ← 在这里才入房  [L1422]
+  4. socket.emit('message', CLIENT_VARS)      ← 发首屏数据
+  5. sessionInfo.rev = headRev                 ← 记录当前修订号
+  6. sessionInfo.time = await pad.getRevisionDate(headRev)
+  7. await exports.updatePadClients(pad)      ← 兜底：补上入房前漏的修订  [L1444]
+```
+
+L1441-1444 的注释讲得很清楚：
+> "Flush any revisions that may have been appended while we were awaiting the clientVars hook (before socket.join). Those revisions were broadcast to existing room members but this socket hadn't joined yet so it missed them."
+
+因为 clientVars hook 期间有多个 await，在这期间如果有协作者推进了修订，那些修订会通过 `updatePadClients()` 广播给已经在房间里的人，但新 socket 还没 join，所以收不到。因此首连分支在 join + 设好 sessionInfo.rev 之后，**显式调用一次 updatePadClients 做兜底**，把漏掉的 revision 以 NEW_CHANGES 形式补回来。
+
+#### reconnect 分支（L1208-1269）
+
+```
+顺序：
+  1. socket.join(sessionInfo.padId)          ← 第一时间入房  [L1211]
+  2. sessionInfo.rev = message.client_rev     ← 用客户端自称的修订号
+  3. 自行拉取 revisionsNeeded（client_rev+1 .. head）
+  4. 逐条 socket.emit CLIENT_RECONNECT
+  5. （没有 updatePadClients 兜底调用）
+```
+
+reconnect 分支**没有显式调用 updatePadClients 兜底**，原因是它采用了不同的策略：
+- join 放在最前面，尽早开始接收后续的 NEW_CHANGES 广播；
+- 历史修订由 CLIENT_RECONNECT 自行负责，按顺序逐条发送；
+- 在 await 拉取 revision 数据期间，如果有新编辑发生，`updatePadClients()` 会自动把 NEW_CHANGES 推给这个 socket（因为它已经 join 了房间，且 sessionInfo.rev 已设置）。
+
+#### 不对称带来的乱序窗口
+
+reconnect 分支的"先 join 再补历史"策略会引入一个乱序窗口：
+
+**场景**：客户端断线时 rev=100，服务端当前 head=150。重连时在 await 拉取 rev 数据期间又有新编辑推到 152。
+
+到达客户端的消息顺序可能是：
+```
+CLIENT_RECONNECT newRev=101  ← 历史补回，按序
+CLIENT_RECONNECT newRev=102  ← 历史补回，按序
+...
+NEW_CHANGES    newRev=151   ← 新编辑，从 updatePadClients 广播过来
+NEW_CHANGES    newRev=152   ← 新编辑
+...
+CLIENT_RECONNECT newRev=120  ← 历史补回的后面部分还在继续发
+CLIENT_RECONNECT newRev=121  ← （因为 CLIENT_RECONNECT 是同步逐条 emit，在事件循环里排在 updatePadClients 之后）
+```
+
+不对——实际上 CLIENT_RECONNECT 的 for 循环（L1250-1261）是同步 emit 的，它和 updatePadClients 里的 Promise.all + map 是并发关系。如果 CLIENT_RECONNECT 先发到 140，然后 updatePadClients 的 NEW_CHANGES 到了 151、152，然后 CLIENT_RECONNECT 继续发 141…150，那么客户端会收到：140 → 151 → 152 → 141 → 142 → … → 150。
+
+客户端的 `serverMessageTaskQueue` 保证**按到达顺序**串行处理。NEW_CHANGES 分支要求严格 `newRev === rev + 1`，所以当 newRev=151 到达而 rev 才到 140 时，会 `console.warn` 然后跳过（见十一章 11.5）。后面的 CLIENT_RECONNECT newRev=141 会正常推进 rev。
+
+这是一个已知的乱序窗口：中间部分 NEW_CHANGES 会被短暂跳过并打 warning，但最终 CLIENT_RECONNECT 会把它们补回来。由于 NEW_CHANGES 和 CLIENT_RECONNECT 都会调用 `applyChangesToBase` 把 changeset 应用到 baseAText 上，且内容完全相同，所以数据是一致的——只是用户会看到"先跳到后面的编辑，又退回来"的视觉跳变，以及控制台的几条 warning。
+
+### 13.2 updatePadClients：NEW_CHANGES 的统一出口
+
+`updatePadClients`（[PadMessageHandler.ts:1008-1066](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1008-L1066)）是 Etherpad 协作层**唯一的 NEW_CHANGES 广播出口**。所有导致 pad 内容变化的操作最终都调用它。
+
+#### 核心逻辑
+
+```
+1. 取房间内所有 sockets：_getRoomSockets(pad.id)
+2. 如果没人，直接 return（L1011）
+3. 建一个 revCache 缓存本次循环用到的 revision 对象（避免重复查 DB）
+4. 对每个 socket 并行处理（Promise.all）：
+   · 取 sessioninfo.rev
+   · while sessioninfo.rev < head:
+       o 取下一条 revision
+       o prepareForWire 翻译属性池
+       o socket.emit(NEW_CHANGES, {newRev, changeset, apool, author, time, timeDelta})
+       o sessioninfo.rev = r  // 推进该 socket 的记录
+       o sessioninfo.time = currentTime
+```
+
+关键特性：
+- **按 socket 独立推进**：每个 socket 有自己的 `sessioninfo.rev`，互不影响。慢的 socket 不会拖慢快的 socket。
+- **timeDelta 计算**：`timeDelta = currentTime - sessioninfo.time`，客户端用它来校准协作时间线。
+- **revCache 共享**：所有 socket 共享一个 revCache Map，第一条读到的 revision 会被后面的 socket 复用，大幅减少 DB 查询。
+- **容错**：单 socket emit 失败（比如连接已断）只打 error log 并 return，不影响其他 socket。
+
+#### 所有调用方
+
+| 调用方 | 位置 | 触发时机 |
+|--------|------|---------|
+| `handleUserChanges`（用户编辑提交） | [L997](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L997) | 每次成功 apply 一条用户 changeset |
+| `handlePadDelete` 间接（通过 pad.remove） | —— | pad 删除后 padChannels 自动清理 |
+| `ImportHandler.reloadPad` / `setText` | [ImportHandler.ts:190,310](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/ImportHandler.ts#L190) | 导入文件替换 pad 内容后 |
+| `API.copyPad` / `movePad` / `deletePad` / `restoreRevision` | [API.ts:242,265,332,670](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/db/API.ts#L242) | HTTP API 修改 pad 内容后 |
+| 首连兜底 | [L1444](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1444) | 首次连接入房前漏的修订 |
+
+注意：**reconnect 分支的 CLIENT_RECONNECT 不经过 updatePadClients**——它直接从 pad 拉取 revision 并逐条 emit，走的是一条独立的补历史路径。这也是 13.1 节提到的不对称性来源。
+
+### 13.3 USER_NEWINFO：重连也无条件广播
+
+在 `handleClientReady` 函数的末尾（[L1447-1508](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1447-L1508)），有两组 USER_NEWINFO 广播和一个 userJoin hook 调用，它们**在 if-else 块之外**——也就是说 **reconnect 和首次连接都会执行**。
+
+#### 两组广播
+
+**第一组：向其他人广播"我来了"**（L1447-1458）
+```
+socket.broadcast.to(padId).emit('message', {
+  type: 'USER_NEWINFO',
+  userInfo: { colorId, name, userId: sessionInfo.author }
+});
+```
+
+**第二组：向我广播"其他人都在"**（L1460-1499）
+```
+Promise.all(_getRoomSockets(pad.id).map(roomSocket => {
+  if (roomSocket.id === socket.id) return;
+  ... 查 authorInfo ...
+  socket.emit('message', { type: 'USER_NEWINFO', userInfo: {...} });
+}));
+```
+
+还有第三处：`userJoin` hook（L1501-1508），插件可以监听它做额外处理。
+
+#### 重连场景下的影响
+
+因为 reconnect 也会触发这些广播，重连时：
+- **其他客户端**：会收到一份该用户的 USER_NEWINFO。由于客户端用户集合是按 userId 去重的，收到重复 USER_NEWINFO 是幂等操作——只是更新一下名字/颜色，不会多一个用户头像。副作用是用户列表里该用户可能会"闪一下"（先消失再出现），但这取决于前端实现（[collab_client.ts:268-278](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L268-L278) 是直接 `set()` 覆盖，没有消失动画）。
+- **重连的客户端自己**：会收到一份完整的在线用户列表。这很重要——因为断线期间可能有人加入或离开，如果不重发，客户端的用户列表就过期了。CLIENT_VARS 不重发，但 USER_NEWINFO 的"完整快照"相当于补上了用户列表这一项。
+
+#### 与 USER_LEAVE 的配合
+
+断线时 Socket.IO 的 `disconnect` 事件会触发 `handleDisconnect`（[L245-287](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L245-L287)），其中有个 `isLastSocketForAuthor` 判断：只有该作者的**最后一个 socket** 离开时才广播 USER_LEAVE。这和 11.4 节讲的"stale tab userdup 踢人"是同一个设计思路——允许多设备同账号并发。
+
+因此实际时序是：
+```
+用户断网
+  → 服务端 detect disconnect
+  → 如果是该作者最后一个 socket：广播 USER_LEAVE
+  → （几秒后）用户网络恢复，socket.io reconnect
+  → 客户端发 CLIENT_READY + reconnect=true
+  → 服务端 handleClientReady
+  → 广播 USER_NEWINFO（作者重新出现）
+  → 向客户端发完整在线用户列表
+  → 发 CLIENT_RECONNECT 补历史修订
+```
+
+如果用户只是"短暂闪断"（浏览器没感知到，socket.io 快速重连），且 disconnect 事件还没来得及触发（或不是最后一个 socket），那么 USER_LEAVE → USER_NEWINFO 的循环就不会发生，用户列表完全不动。
+
+### 13.4 CLIENT_VARS 不重发：哪些有运行时通道，哪些只能刷新
+
+温合重连时服务端明确不重发 CLIENT_VARS（L1209 注释："we don't have to send the client the ClientVars again"）。clientVars 是一个很大的对象，首屏注入时包含了 pad 的元信息、配置、插件变量等。重连时哪些能动态同步、哪些必须等页面刷新，整理如下：
+
+#### 有运行时同步通道的（重连会自动对齐）
+
+| 数据 | 同步通道 | 对应消息类型 |
+|------|---------|-------------|
+| 文档文本内容 | 协作层 | NEW_CHANGES / CLIENT_RECONNECT |
+| 属性池（apool）编号映射 | 协作层 | 每条 NEW_CHANGES / CLIENT_RECONNECT 附带精简 apool + moveOpsToNewPool 翻译 |
+| 在线用户列表 | 协作层 | USER_NEWINFO（完整快照）/ USER_LEAVE |
+| 用户名字/颜色 | 协作层 | USER_NEWINFO |
+| 聊天消息 | 聊天模块 | CHAT_MESSAGE / CHAT_MESSAGES（客户端可主动 GET_CHAT_MESSAGES 拉历史） |
+| 插件自定义消息 | 插件 hook | CLIENT_MESSAGE |
+| 协作者光标/选区 | 插件 | 通常走 CLIENT_MESSAGE，由 ep_cursor_list 等插件实现 |
+
+#### 只能等页面刷新的（重连不会同步）
+
+| 数据 | 在 clientVars 中的位置 | 为什么不同步 |
+|------|----------------------|-------------|
+| **插件列表及插件 clientVars 注入** | `pad.plugins` + 各插件通过 clientVars hook 注入的字段 | 重连不跑 `clientVars` hook，插件新增/移除的运行时变量不会更新 |
+| pad 基本配置（`padOptions`） | `padOptions` | 服务端配置改了不会推给已连接客户端 |
+| 删除权限 | `deletePadEnabled` | 只在首屏计算一次（基于 isCreator、token、allowPadDeletionByAllUsers） |
+| 账号权限 | `accountPrivileges` | 同上，首屏一次性计算 |
+| 只读模式 | `readOnly` / `readOnlyPadId` | 只读状态切换必须刷新页面 |
+| 保存的修订列表 | `savedRevisions` | 没有运行时推送通道，只能刷新或手动触发 |
+| UI 配置（滚动行为等） | `scrollWhenFocusLineIsOutOfViewport` | 纯前端配置，改 settings.json 后需刷新 |
+| Cookie 前缀、环境模式 | `cookiePrefix` / `mode` | 环境信息，生命周期内不变 |
+| cookieConsent 同意状态 | `cookieConsent` | 首屏一次性注入 |
+| 自动重连配置 | `automaticReconnection` | 首屏一次性注入 |
+| 客户端 IP | `clientIp` | 首屏注入，重连后 IP 不变（同连接） |
+
+#### 一个容易忽略的坑：插件的 clientVars hook
+
+重连时 `clientVars` hook 不跑，意味着插件如果在 hook 里注入了动态数据（比如实时统计、在线人数等），重连后这些数据不会更新。插件作者如果需要重连时刷新数据，需要自己监听 socket 的 reconnect 事件主动拉取，或者通过 CLIENT_MESSAGE 自定义通道推送。
+
+这也是为什么 13.3 节 USER_NEWINFO 的"重连也广播完整用户列表"这么重要——用户列表是 CLIENT_VARS 里少数几个在重连时有专门同步通道的动态元数据。
