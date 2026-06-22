@@ -20,12 +20,17 @@
   - [4.2 Loader 加载流程](#42-loader-加载流程)
   - [4.3 语言代码规范化与回退链](#43-语言代码规范化与回退链)
   - [4.4 Import 规则（链式加载）](#44-import-规则链式加载)
+  - [4.5 优先级数组的展开与反转合并](#45-优先级数组的展开与反转合并)
+  - [4.6 build() 中的二级主标签前缀回退](#46-build-中的二级主标签前缀回退)
 - [5. 阶段四：翻译文本的页面应用](#5-阶段四翻译文本的页面应用)
   - [5.1 DOM 标记方式（data-l10n-id）](#51-dom-标记方式data-l10n-id)
   - [5.2 翻译键与属性后缀约定](#52-翻译键与属性后缀约定)
   - [5.3 宏系统与复数规则（plural）](#53-宏系统与复数规则plural)
   - [5.4 参数插值（{{variable}}）](#54-参数插值variable)
   - [5.5 无障碍支持（aria-label 自动填充）](#55-无障碍支持aria-label-自动填充)
+  - [5.6 动态新增节点的增量翻译](#56-动态新增节点的增量翻译)
+  - [5.7 编程式取翻译字串接口](#57-编程式取翻译字串接口)
+  - [5.8 客户端语言读写两条独立链路与持久化默认行为](#58-客户端语言读写两条独立链路与持久化默认行为)
 - [6. Admin SPA 的独立 i18n 体系（i18next）](#6-admin-spa-的独立-i18n-体系i18next)
   - [6.1 初始化与语言检测](#61-初始化与语言检测)
   - [6.2 懒加载后端（LazyImportPlugin）](#62-懒加载后端lazyimportplugin)
@@ -154,7 +159,7 @@ description 翻译的三级回退 [socialMeta.ts#L33-L52](file:///d:/fz/0601-2/s
 
 ```typescript
 // 1. 尝试从 Cookie 读取（支持 cookiePrefix 命名空间）
-const cp = (clientVars?.cookiePrefix || '').replace(/regex-escaped/g, ...);
+const cp = ((window as any).clientVars?.cookiePrefix || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 let language = document.cookie.match(new RegExp(`${cp}language=((\\w{2,3})(-\\w+)?)`))
     || document.cookie.match(/language=((\\w{2,3})(-\\w+)?)/);
 
@@ -165,14 +170,12 @@ html10n.mt.bind('indexed', () => {
 
 // 3. 翻译完成后写回 DOM 属性
 html10n.mt.bind('localized', () => {
-  document.documentElement.lang = html10n.getLanguage();
-  document.documentElement.dir = html10n.getDirection();
+  document.documentElement.lang = html10n.getLanguage()!;
+  document.documentElement.dir = html10n.getDirection()!;
 });
 ```
 
-**关键点**：`localize()` 接受一个**优先级数组**，但其合并行为需要理解 `localize()` 自身的数组展开和 `build()` 的 `reverse()` 机制，详见[第 4.5 节](#45-优先级数组的展开与合并顺序)。
-
-**易错认知**：乍一看容易认为"后面的语言作为前面语言的缺失翻译的补充"、"最终生效的语言是数组中最后一个成功加载的语言"——这两句**都与实际代码行为相反**。正确的理解是：高优先级语言后应用并覆盖低优先级语言的相同 key，最终生效语言是原始数组中第一个（最高优先级）成功加载的语言。
+**关键点**：`localize()` 接受一个**优先级数组**。合并顺序和最终生效语言并非"后面补齐前面"——而是高优先级后应用并覆盖，详见[第 4.5 节](#45-优先级数组的展开与反转合并)。
 
 ### 3.3 URL 查询参数（?lang=）
 
@@ -184,6 +187,7 @@ html10n.mt.bind('localized', () => {
   checkVal: null,
   callback: (val) => {
     html10n.localize([val, 'en']);        // 立即切换语言
+    const prefix = (window as any).clientVars?.cookiePrefix || '';
     Cookies.set(`${prefix}language`, val); // 写入 Cookie 持久化
   },
 }
@@ -195,9 +199,10 @@ html10n.mt.bind('localized', () => {
 
 当管理员为某个 Pad 全局设置了语言后，会通过 Socket.io 的 `CLIENT_VARS` 消息下发到 `clientVars.padOptions.lang`。
 
-读取路径 [pad.ts#L560-L565](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L560-L565)：
+读取路径 [pad.ts#L559-L567](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L559-L567)：
 ```typescript
 const effectiveOptions = $.extend(true, {}, pad.padOptions);
+if (pad.isPadSettingsEnforcedForMe()) return normalizeChatOptions(effectiveOptions);
 const overrides = getMyViewOverrides(); // 合并 Cookie 中的用户偏好
 for (const key of ['showChat', 'alwaysShowChat', 'chatAndUsers', 'lang']) {
   if (overrides[key] != null) effectiveOptions[key] = overrides[key];
@@ -223,7 +228,7 @@ applyLanguage: (lang) => {
 },
 ```
 
-同时通过 `setMyViewLanguage()` [pad.ts#L644](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L644) 将选择写入 Cookie 持久化。
+同时通过 `setMyViewLanguage()` [pad.ts#L644-L648](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L644-L648) 将选择写入 Cookie 持久化。
 
 ---
 
@@ -292,10 +297,10 @@ html10n.build() ───► asyncForEach(langs, Loader.load)
           │                │                │
           ▼                ▼                ▼
   当作路径递归 fetch   langs.set()   按 BCP 47 层级逐层剥离
-  （Import 规则）     存入缓存     - → zh-Hans → zh → 查找变体
+  （Import 规则）     存入缓存     → zh-hans → zh → 查找变体
 ```
 
-`build()` 方法会把优先级数组中所有语言的翻译按顺序叠加合并：**低优先级语言先应用，高优先级后应用**，所以缺失的 key 会由更低优先级的语言补齐（典型：英文兜底）。
+`build()` 的合并顺序并非按数组顺序直接叠加——而是先 `reverse()` 再遍历覆盖，详见下一节。
 
 ### 4.3 语言代码规范化与回退链
 
@@ -320,10 +325,12 @@ zh-hk   → zh-hant-hk
 
 **多级回退链**（当精确语言找不到时）[html10n.ts#L957-L985](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L957-L985)：
 
-以 `zh-Hans-CN` 为例：
-1. 尝试 `zh-hans-cn`（原始值）
+以浏览器传入 `zh-Hans-CN` 为例：
+1. 尝试精确匹配 `zh-hans-cn`（经 getBcp47LangCode 规范化）
 2. 循环剥离最后一个 `-`：`zh-hans` → `zh`
-3. 若仍找不到，遍历所有可用语言，查找是否有 `zh-` 开头的变体（如 `zh-hans`、`zh-hant`），取第一个匹配
+3. 若仍找不到，执行变体扫描——**注意：扫描前缀取自原始浏览器输入语言 `lang`，而非剥离后的 `bcp47LangCode`**。具体代码 [html10n.ts#L974](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L974) 为 `l.indexOf(lang + '-') === 0`，`lang` 是 `parse(lang, href, data, callback)` 的入参（原始值）。
+
+**变体扫描标签来源的影响**：如果 `Loader.load('zh-CN', ...)` 直接调用，`lang = 'zh-CN'`，变体扫描会查找 `zh-CN-` 开头的 key，无法匹配 `zh-hans`。实际运行不会出问题，因为 `localize()` 在调用 `Loader.load` 前已把含 `-` 的语言展开，追加了主标签前缀（如 `'zh'`），后续 `Loader.load('zh', ...)` 用前缀 `zh-` 可以正常匹配 `zh-hans`、`zh-hant` 等变体。
 
 ### 4.4 Import 规则（链式加载）
 
@@ -339,6 +346,86 @@ zh-hk   → zh-hant-hk
 - 相对路径：相对于当前资源文件的 URL 解析（`href + "/../" + data[lang]`）
 
 这就是为什么英文必须内联——避免额外的一次 HTTP 请求，同时保证英文兜底总能加载成功。
+
+### 4.5 优先级数组的展开与反转合并
+
+这是理解翻译结果的关键环节，涉及 `localize()` 和 `build()` 两个方法的配合。
+
+#### 第一步：`localize()` 原地展开数组
+
+[html10n.ts#L474-L490](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L474-L490)
+
+`localize()` 在把数组传给 `build()` 之前，会对数组做**原地展开**：对每个含 `-` 的语言代码，额外追加其主标签前缀。
+
+```typescript
+let i = 0
+langs.forEach((lang) => {
+  if(!lang) return;
+  langs[i++] = lang;
+  if(~lang.indexOf('-')) langs[i++] = lang.substring(0, lang.indexOf('-'));
+})
+```
+
+示例：输入 `['de-AT', 'en']`，展开后变为 `['de-AT', 'de', 'en']`。
+
+⚠ **原地展开的副作用**：展开过程是边遍历边写入 `langs[i++]`，当排在 `'en'` 之前的语言含 `-` 时，追加的主标签会**覆盖**后续尚未遍历的元素。例如输入 `['zh-CN', 'de-AT', 'en']`：
+- 处理 `'zh-CN'`：写入 `langs[0]='zh-CN'`、追加 `langs[1]='zh'`
+- 但 `langs[1]` 原本是 `'de-AT'`，已被覆盖
+- 最终 `'de-AT'` 和 `'en'` 都会丢失
+
+实际运行中影响有限，因为 [l10n.ts#L12](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/l10n.ts#L12) 的 `localize([regexpLang, navigator.language, 'en'])` 中 `regexpLang` 常为 `undefined`（无 Cookie 时），`forEach` 会跳过它。
+
+#### 第二步：`build()` 反转后高优先级覆盖低优先级
+
+[html10n.ts#L526-L579](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L526-L579)
+
+1. `asyncForEach` 按原始顺序加载所有语言资源
+2. 全部加载完成后，执行 `langs.reverse()`——**反转数组**
+3. 遍历反转后的数组，逐个语言的字符串写入 `build` Map
+4. 由于 `Map.set()` 对同一 key 会覆盖，**后写入者胜出**
+5. 每写入一个语言的字符串，更新 `this.language` 为当前语言代码
+
+以展开后的 `['de-AT', 'de', 'en']` 为例：
+
+```
+原始数组（展开后）：  ['de-AT', 'de', 'en']
+reverse 后：         ['en',    'de', 'de-AT']
+遍历写入：           en 的 key 先写 → de 覆盖 en 的同名 key → de-AT 覆盖 de 的同名 key
+合并结果：           de-AT 优先级最高，其 key 存活；缺失的 key 由 de 补齐，再缺失由 en 补齐
+this.language = 'de-AT'   （最后一个写入的语言 = 原始数组第一个 = 最高优先级）
+```
+
+**结论**：
+- **合并效果**：高优先级（原始数组靠前的）语言的翻译覆盖低优先级语言的相同 key，低优先级语言仅补充高优先级语言缺失的 key（英文作为兜底）
+- **最终生效语言**：`this.language` 是原始数组中**第一个**（最高优先级）成功加载的语言，不是最后一个
+- `getLanguage()` 返回的就是这个值 [html10n.ts#L585-L587](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L585-L587)
+
+### 4.6 build() 中的二级主标签前缀回退
+
+[html10n.ts#L561-L572](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L561-L572)
+
+在遍历反转后的数组写入 `build` Map 时，如果某个语言代码在 `loader.langs` 中找不到精确匹配，`build()` 会退而求其次使用主标签前缀：
+
+```typescript
+if (this.loader!.langs.has(lang)) {
+  // 精确匹配：直接使用
+  for (let string in this.loader!.langs.get(lang)) {
+    build.set(string, this.loader!.langs.get(lang)[string])
+  }
+  this.language = lang
+} else {
+  // 二级回退：使用主标签前缀（如 'de-AT' → 'de'）
+  const loaderLang = lang.split('-')[0]
+  for (let string in this.loader!.langs.get(loaderLang)) {
+    build.set(string, this.loader!.langs.get(loaderLang)[string])
+  }
+  this.language = loaderLang
+}
+```
+
+这意味着即使 `loader.langs` 中没有 `de-AT` 的独立翻译包，只要有 `de` 的包，`de-AT` 的翻译仍能以 `de` 的内容作为回退，且 `this.language` 会被设为 `'de'` 而非 `'de-AT'`。
+
+注意：此回退**不检查** `loader.langs.has(loaderLang)`，如果主标签也不存在，会在 `loader.langs.get(undefined)` 上抛出异常。但由于 `localize()` 已经把主标签追加到了数组中，`Loader.load` 会保证主标签已加载，因此此分支在正常使用中不会触发异常。
 
 ---
 
@@ -402,7 +489,10 @@ html10n.get('pad.chat.nUsers', {n: 1});  // "1 user"
 html10n.get('pad.chat.nUsers', {n: 0});  // "No users"
 ```
 
-复数规则函数通过语言代码查表获取 [html10n.ts#L72-L468](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L72-L468)，覆盖了 200+ 种语言的 CLDR 复数规则（英文是规则 3：`n==1` 用 one，其余 other）。
+复数规则函数通过语言代码查表获取 [html10n.ts#L72-L468](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L72-L468)。`locales2rules` 映射表包含约 170 个语言代码条目（从 `af` 到 `zu`），映射到 25 条复数规则函数（规则 0 到规则 24），涵盖 CLDR 标准中的主要复数类别（zero、one、two、few、many、other）。例如：
+- 英文 → 规则 3：`n==1` 用 one，其余 other
+- 阿拉伯语 → 规则 1：支持 zero / one / two / few / many / other 六种形式
+- 中文 → 规则 0：全部 other，不分单复数
 
 ### 5.4 参数插值（{{variable}}）
 
@@ -436,6 +526,150 @@ html10n.get('pad.userlist.welcome', {userName: 'Alice', padName: 'MyPad'});
 则将翻译后的文本同步写入 `aria-label`，保证屏幕阅读器能读出正确的本地化文本。切换语言时会被覆盖更新。
 
 对于 `<select>`、`<input>`、`<textarea>` 这类表单控件——它们的可访问名称不来自 textContent 而是 aria-label——代码会走专用分支 [html10n.ts#L683-L692](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L683-L692)，只写 aria-label，避免误报 "找不到文本节点" 的 warning。
+
+### 5.6 动态新增节点的增量翻译
+
+页面初始加载时，`localize()` 完成后会调用 `translateElement(translations)` 翻译整个 `document.documentElement`。但在运行时，JS 动态创建的 DOM 节点不会自动翻译——需要调用方**手动触发增量翻译**。
+
+核心 API 是 `html10n.translateElement(translations, element)` [html10n.ts#L498-L508](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L498-L508)，第二个参数限定翻译范围，避免重翻整棵 DOM 树。
+
+**调用场景**：
+
+1. **聊天消息** [chat.ts#L207](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/chat.ts#L207)：
+   ```typescript
+   chatMsg.each((i, e) => html10n.translateElement(html10n.translations, e));
+   ```
+   每条新消息插入 DOM 后立即翻译。聊天通知弹窗也同理 [chat.ts#L222](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/chat.ts#L222)。
+
+2. **断线重连模态框** [pad_automatic_reconnect.ts#L52-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_automatic_reconnect.ts#L52-L54)：
+   ```typescript
+   const localize = ($element) => {
+     html10n.translateElement(html10n.translations, $element.get(0));
+   };
+   ```
+   封装为工具函数，每次模态框插入 DOM 后调用。
+
+3. **`<input>` 占位文本** [pad_editor.ts#L226-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts#L226-L238)：html10n 的 `translateNode` 默认跳过 `<input>` 元素，因此需要在 `localized` 事件中手动用 `html10n.get()` + `input.val()` 逐个设置：
+   ```typescript
+   html10n.bind('localized', () => {
+     $('input[data-l10n-id]').each((key, input) => {
+       input = $(input);
+       if (input.hasClass('editempty')) {
+         input.val(html10n.get(input.attr('data-l10n-id')));
+       }
+     });
+   });
+   ```
+
+**模式总结**：所有动态内容都遵循同一模式——
+1. 创建 DOM 节点并标记 `data-l10n-id`
+2. 插入 DOM 树
+3. 调用 `html10n.translateElement(html10n.translations, element)` 增量翻译
+
+### 5.7 编程式取翻译字串接口
+
+除了 DOM 标记方式，html10n 还提供了编程式获取翻译字串的接口。
+
+**`html10n.get(id, args?)`** [html10n.ts#L713-L727](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L713-L727)
+
+```typescript
+html10n.get('pad.chat.nUsers', {n: 5});    // "5 users"
+html10n.get('pad.delete.confirm');           // "Are you sure?"
+```
+
+执行流程：
+1. 从 `this.translations` Map 中查找 key
+2. 如果找不到，`console.warn` 并返回 `undefined`
+3. 如果找到，依次调用 `substMacros()`（复数等宏展开）和 `substArguments()`（`{{var}}` 插值）
+4. 返回最终字符串
+
+**`window._(id, args?)`** [html10n.ts#L1026](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts#L1026)
+
+```typescript
+// gettext-like shortcut — always set this so plugins can use window._() for localization.
+window._ = html10n.get;
+```
+
+这是 gettext 风格的快捷方式，始终挂载到 `window._`，供插件使用。内部代码通过 `import html10n` 调用 `html10n.get()`，两者等价。
+
+**使用场景**：
+
+1. **`window.confirm` / `window.alert` 中的文本** [pad_editor.ts#L166](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts#L166)：
+   ```typescript
+   if (!window.confirm(html10n.get('pad.delete.confirm'))) return;
+   ```
+
+2. **服务端推送消息的翻译** [pad_editor.ts#L178-L180](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts#L178-L180)：
+   ```typescript
+   const msg = payload?.messageKey
+       ? html10n.get(payload.messageKey)
+       : payload?.message;
+   ```
+
+3. **`<input>` 占位文本**（上文已述，`html10n.get(input.attr('data-l10n-id'))`）
+
+### 5.8 客户端语言读写两条独立链路与持久化默认行为
+
+Etherpad 的客户端存在两条**相互独立**的语言持久化链路，它们写入不同的存储、走不同的读取链路，且默认行为不同：
+
+#### 链路 A：Cookie 路径（`Cookies.set` / `Cookies.get`）
+
+**写入触发点**：
+
+1. **URL `?lang=` 参数** [pad.ts#L187-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L187-L191)：
+   ```typescript
+   html10n.localize([val, 'en']);
+   Cookies.set(`${prefix}language`, val);
+   ```
+
+2. **"我的视图" 语言下拉菜单**（`#languagemenu`）[pad_editor.ts#L85-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts#L85-L86) → [pad.ts#L644-L648](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L644-L648)：
+   ```typescript
+   setMyViewLanguage: (lang) => {
+     const cp = clientVars?.cookiePrefix || '';
+     Cookies.set(`${cp}language`, lang);
+     pad.refreshMyViewControls();
+     pad.applyOptionsChange();
+   },
+   ```
+
+**读取点**：
+
+1. **`l10n.ts` 初始化** [l10n.ts#L7-L9](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/l10n.ts#L7-L9) — 用正则从 `document.cookie` 读取，作为 `localize()` 的最高优先级参数
+2. **`getCookieLanguage()`** [pad.ts#L221-L224](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L221-L224) — 用 `Cookies.get()` 读取，汇入 `getMyViewOverrides()` 的 `lang` 字段
+
+#### 链路 B：padcookie + 服务端中转路径
+
+**写入触发点**：
+
+**"Pad 设置" 语言下拉菜单**（`#padsettings-languagemenu`）[pad_editor.ts#L241-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts#L241-L242) → `pad.changePadOption('lang', val)` [pad.ts#L882-L892](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L882-L892)：
+```typescript
+changePadOption: (key, value) => {
+  // 发送到服务器（更新服务端 padOptions.lang，对所有人生效）
+  pad.collabClient.sendClientMessage({
+    type: 'CLIENT_MSG',
+    component: 'pad',
+    name: 'changePadOption',
+    data: {key, value, changedBy: pad.myUserInfo.name || 'unnamed'},
+  });
+  // 同步当前用户的个人偏好
+  pad.setMyViewOption(key, value);  // 'lang' 走 default 分支: padcookie.setPref(key, value)
+},
+```
+
+**读取点**：
+- **服务端回传**：`changePadOption` 将语言发送到服务端后，服务端保存并在下次加载时通过 `clientVars.padOptions.lang` 下发，由 `getParams()` → `applyLanguage()` 重新应用
+- **不读取 padcookie**：`getMyViewOverrides()` 中的 `lang` 字段取自 `getCookieLanguage()`（链路 A），而非 `padcookie.getPref('lang')`
+
+#### 两条链路的交互与默认行为
+
+| 场景 | 链路 A (Cookie) | 链路 B (padcookie + 服务端) | 下次加载实际生效 |
+|------|----------------|--------------------------|----------------|
+| 用户从未选择语言 | 无 `language` Cookie | 无 `lang` pref / 无 padOptions.lang | `l10n.ts` 传 `undefined` → `navigator.language` → `'en'` |
+| `#languagemenu` 选语言（我的视图） | ✅ 写入 Cookie | ❌ 不写入 | 从 Cookie 读取 → 纯客户端持久化 ✅ |
+| `#padsettings-languagemenu` 选语言（Pad 设置） | ❌ 不写入 | ✅ padcookie.setPref + 服务端保存 | Cookie 无值 → 走 `navigator.language`；但 `clientVars.padOptions.lang` 已被服务端更新，由 `getParams()` 回传应用 |
+| `?lang=` URL 参数 | ✅ 写入 Cookie | ❌ 不写入 | 同 `#languagemenu` |
+
+**关键发现**：`#padsettings-languagemenu` 选择语言后写入的 padcookie，`l10n.ts` 的初始化流程**读不到**。实际之所以能持久化，是因为 `changePadOption` 把语言发到了服务端，下次加载时 `clientVars.padOptions.lang` 已包含该值，通过 `getParams()` → `applyLanguage()` 重新应用。这是一种**服务端中转**的持久化方式，与链路 A 的**纯客户端 Cookie** 持久化是两条完全独立的链路。
 
 ---
 
@@ -487,8 +721,6 @@ read: async (language, namespace, callback) => {
 
 ### 6.3 React 组件中的使用
 
-遵循 AGENTS.md 中的强制约定：
-
 ```tsx
 // JSX 文本：用 <Trans />（保留插值的 React 节点结构）
 import { Trans } from 'react-i18next';
@@ -522,6 +754,9 @@ t('admin_pads.count_pads', {count: pads.length});
 | **Pad 启动入口** | [src/templates/padBootstrap.js](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/templates/padBootstrap.js) | `window.clientVars` 初始化，加载 `l10n.ts` |
 | **客户端语言初始化** | [src/static/js/l10n.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/l10n.ts) | Cookie 读取 → `html10n.localize()` → 更新 `<html lang>` |
 | **核心翻译库（Pad UI）** | [src/static/js/vendors/html10n.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/vendors/html10n.ts) | `Html10n` 类、`Loader` 类、复数规则、DOM 翻译 |
-| **Pad 语言控制** | [src/static/js/pad.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts) | `getParameters`、`applyLanguage()`、`getMyViewOverrides()` |
+| **Pad 语言控制** | [src/static/js/pad.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts) | `getParameters`、`applyLanguage()`、`getMyViewOverrides()`、`getCookieLanguage()`、`setMyViewLanguage()`、`changePadOption()` |
+| **Pad 编辑器 UI** | [src/static/js/pad_editor.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts) | `#languagemenu` / `#padsettings-languagemenu` 事件绑定、`localized` 事件中 `<input>` 占位翻译 |
+| **聊天消息翻译** | [src/static/js/chat.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/chat.ts) | 新消息增量翻译 |
+| **断线重连翻译** | [src/static/js/pad_automatic_reconnect.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_automatic_reconnect.ts) | 模态框增量翻译 |
 | **核心语言资源（英文基准）** | [src/locales/en.json](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/locales/en.json) | 所有翻译 key 的基准定义 |
 | **Admin SPA i18n** | [admin/src/localization/i18n.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/admin/src/localization/i18n.ts) | i18next 初始化 + LazyImportPlugin |
