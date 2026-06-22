@@ -433,4 +433,271 @@ class {
  ▼
 ```
 
-这条链路中任何一个环节出问题（比如 CLIENT_RECONNECT 校验 newRev 失败），系统都不会强抛异常——仅打 `console.warn`，留待后续 `slowcommit` 超时或用户手动刷新兜底，最大程度保证“页面始终可操作、可手动重连”。
+这条链路中任何一个环节出问题（比如 CLIENT_RECONNECT 校验 newRev 失败），系统都不会强抛异常——仅打 `console.warn`，留待后续 `slowcommit` 超时或用户手动刷新兜底，最大程度保证"页面始终可操作、可手动重连"。
+
+---
+
+## 八、OT 对齐深度：compose/follow 如何对齐本地未发编辑与历史修订
+
+重连场景最绕的部分就是：服务端补回的 `CLIENT_RECONNECT` 逐条 `applyChangesToBase()` 时，如何让 **submittedChangeset（断线前已发未确认）** 和 **userChangeset（断线期间继续累积的本地打字）** 都能正确前进，既不丢字也不重复。
+
+### 8.1 compose 与 follow 的语义区别
+
+两者入口都在 [Changeset.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/Changeset.ts)，语义截然不同：
+
+| 函数 | 签名 | 适用场景 | 关键断言 |
+|------|------|----------|----------|
+| `compose(cs1, cs2, pool)` | [L755-784](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/Changeset.ts#L755-L784) | 串联：cs1 先发生，**紧接着** cs2 发生，`cs1.newLen === cs2.oldLen` | `assert(len2 === unpacked2.oldLen, 'mismatched composition')` |
+| `follow(cs1, cs2, reverseInsertOrder, pool)` | [L1446-1585](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/Changeset.ts#L1446-L1585) | **并发（OT 变换）**：cs1、cs2 都基于同一旧文档，要把它们"投影"到同一新文档上 | `assert(len1 === len2, 'mismatched follow - cannot transform cs1 on top of cs2')` |
+
+通俗理解：
+- `compose(A, B)` = "先做 A 再做 B，合并成一步"
+- `follow(A, B, true/false)` = "A 和 B 同时发生，把 B 变换到 A 执行后的新坐标"；reverseInsertOrder 解决同位置并发插入的对称性破缺。
+
+### 8.2 applyChangesToBase 里的六步变换链
+
+在 [changesettracker.ts:99-132](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/changesettracker.ts#L99-L132)，每一条服务端补回的 changeset `c`（不管是 NEW_CHANGES 还是 CLIENT_RECONNECT）都会经历这 6 步：
+
+```
+变量名约定：
+  c                     = 当前外部 changeset（服务端来的，基于 baseAText）
+  oldSubmittedChangeset = 断线前已发送给服务器但还没被 ACCEPT 的那份本地提交
+  oldUserChangeset      = 断线期间用户继续打字积累、还没 prepare 的本地编辑
+```
+
+```
+步骤 1  [L108]
+  baseAText = applyToAText(c, baseAText, apool)
+  意义：服务器的权威变更先落地到 baseAText，baseAText 永远前进到 c 执行后的新状态。
+
+步骤 2  [L111-114]（仅 submittedChangeset 存在时执行）
+  submittedChangeset = follow(c, oldSubmittedChangeset, false, apool)
+  意义：把"我刚发出去但没确认的那份提交"变换到『c 已经执行后的新坐标』上。
+        reverseInsertOrder=false → 同位置若并发插入，外部 c 的插入排在前面，我的靠后。
+
+步骤 3  [L110,114]（仅 submittedChangeset 存在时执行）
+  c2 = follow(oldSubmittedChangeset, c, true, apool)
+  意义：算出『如果世界线是先执行我那份旧提交、再执行外部 c』等价的外部 c。
+        下一步 userChangeset 要基于这个 c2 来变换——因为 userChangeset 的位置基准本来就是
+        『oldSubmittedChangeset 之后』（oldSubmitted 是 prepareUserChangeset 时从 userChangeset
+        里抽走前进到 submitted 的，userChangeset 被重置为 identity(newLen)）。
+
+步骤 4  [L117-120]
+  userChangeset = follow(c2, oldUserChangeset, true, apool)
+  意义：把断线期间本地打字的 userChangeset 投影到『外部变更已经发生后的坐标』。
+        preferInsertingAfterUserChanges=true → 反向插入顺序，我的本地插入排在前面，
+        光标不会跳走。
+
+步骤 5  [L121-122]
+  postChange = follow(oldUserChangeset, c2, false, apool)
+  意义：算出『屏幕上最终应该直接应用到 DOM 的 changeset』——这是真正反映到用户眼前的东西，
+        经过相反的插入顺序偏好把外部 c 投射到"用户还以为自己在旧文档打字"的视图上。
+
+步骤 6  [L127]
+  callbacks.applyChangesetToDocument(postChange, preferInsertionAfterCaret=true)
+  意义：把 postChange 打到编辑器 DOM，同时触发 applyingNonUserChanges 标志，
+        防止 DOM 变更被递归地当成用户输入重新 compose 回 userChangeset（L92-94 的早返回）。
+```
+
+### 8.3 一个具体例子
+
+> 场景：baseAText 是 "AB"（长度 2）；用户在位置 1 插入 "X"（变成 "AXB"）→ 这份 USER_CHANGES 刚发出未确认（oldSubmittedChangeset = insert 1 X, oldLen=2, newLen=3）；用户继续在 "X" 后敲 "Y" → oldUserChangeset = insert 2 Y, oldLen=3, newLen=4。
+>
+> 此时断线恢复，服务端补回一条 CLIENT_RECONNECT：**另一个作者在末尾插入了 "Z"**，即 c = insert 2 Z, oldLen=2, newLen=3。
+
+执行 6 步后：
+- 步骤 1：baseAText 成为 "ABZ"
+- 步骤 2：oldSubmittedChangeset 被变换 → 插入位置保持 1（因为插入 Z 在后面不影响），submittedChangeset 仍表示在 1 处插 X，但 oldLen=3/newLen=4
+- 步骤 3：c2 = 先插 X、再插 Z 的等价外部 c → 在新文档的位置 3 插 Z
+- 步骤 4：userChangeset（在 2 处插 Y）被变换 → 仍在 2 处插 Y
+- 步骤 5：postChange = 在屏幕上看到"AB" 末尾出现 Z，光标处 X/Y 布局不变
+
+最终屏幕内容 "AXYB Z"，本地待发送的 submittedChangeset + userChangeset 都在正确坐标，下次发送时 baseRev 已经是 headRev，不会不匹配。
+
+### 8.4 重连特判：CLIENT_RECONNECT 下作者是自己
+
+在 [collab_client.ts:258-260](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L258-L260) 有个特判：
+```
+if (author === pad.getUserId()) {
+  acceptCommit();
+} else {
+  editor.applyChangesToBase(changeset, author, apool);
+}
+```
+
+如果 CLIENT_RECONNECT 补回的那条 revision **本来就是我断线前提交出去的**（服务端在我断线期间接受了它），就走 `acceptCommit()`：
+- `editor.applyPreparedChangesetToBase()`：把 submittedChangeset 合并到 baseAText，并清空 submittedChangeset
+- `setStateIdle()`：committing=false
+- `handleUserChanges()`：立即准备下一轮
+
+这避免了对"自己的已接受变更"再做一遍上面的六步 OT，省算力且不会让同一条 changeset 被重复应用。
+
+---
+
+## 九、心跳超时在哪发起：两层检测的叠加
+
+断线检测并不是单点，而是**传输层心跳 + 应用层超时**两层叠加，各自有不同的触发边界。
+
+### 9.1 第一层：engine.io 的心跳（传输层）
+
+Socket.IO 建立在 engine.io 之上，底层心跳由 engine.io 自动发起，相关参数在 Etherpad 代码中**没有覆盖**，完全使用默认值：
+
+- 服务端创建 socket.io 的位置：[socketio.ts:76-80](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/hooks/express/socketio.ts#L76-L80)
+  ```
+  io = new Server(args.server, {
+    transports: settings.socketTransportProtocols,   // ['websocket','polling']
+    cookie: false,
+    maxHttpBufferSize: settings.socketIo.maxHttpBufferSize, // 1e6
+  })
+  ```
+  注意这里**没有**传 `pingInterval` / `pingTimeout`。
+
+- engine.io v6（Socket.IO v4 依赖）的默认值：
+  - `pingInterval = 25000 ms`  —— 服务端每 25s 向客户端发 ping
+  - `pingTimeout  = 20000 ms`  —— 发出 ping 后 20s 内没收到 pong 就认为断线
+
+- 心跳方向：**由服务端发起 PING**，客户端用 engine.io 内置 PONG 回应。任一方在 pingTimeout 窗口未收到对端包，都触发 `disconnect` 事件，reason 包含 `'ping timeout'` / `'transport close'` / `'transport error'`。
+
+- Etherpad 客户端监听位置：[pad.ts:390-396](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/pad.ts#L390-L396)
+  ```
+  socket.on('disconnect', (reason) => { ... socketReconnecting(); })
+  ```
+  被触发后 Socket.IO 内置的自动重连（reconnectionDelay=1s, 指数退避, 最多 5 次）就开始了。
+
+### 9.2 第二层：collab_client 的应用层超时
+
+即使传输层通着（ping/pong 正常），服务端也可能因为某些卡死 / 队列阻塞不回业务包。handleUserChanges() 用**递归 setTimeout 轮询**做第二道防线：
+
+| 超时阈值 | 位置 | 效果 |
+|----------|------|------|
+| 初始连接 > 20s | [collab_client.ts:102-104](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L102-L104) | `DISCONNECTED('initsocketfail')`，强制重连路径 |
+| committing > 5s | [collab_client.ts:116-117](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L116-L117) | `onConnectionTrouble('SLOW')` → 仅顶部状态栏提示 "正在同步…" |
+| committing > 20s | [collab_client.ts:113-115](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L113-L115) | `DISCONNECTED('slowcommit')`，强制重连路径 |
+| 正常周期 < 500ms | [collab_client.ts:125-129](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L125-L129) | 节流，最短 500ms 才提交一次 |
+| 发送后/空闲时 | [collab_client.ts:120,151,156](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L120-L156) | 每 3s 再次 poll，保证最长 3s 内就能检测到上一档次的超时 |
+
+注意 3s 的检查粒度意味着：`committing > 5s` 的 SLOW 提示在实际时间 6~8s 才出现，`> 20s` 的断开在 21~23s 出现，和 engine.io 45s 的 pingInterval+pingTimeout 错峰，互为兜底。
+
+### 9.3 为什么要两层
+
+| 场景 | 被哪层检测到 | 延迟 |
+|------|-------------|------|
+| 拔网线、断 Wi-Fi | 传输层（TCP RST / 浏览器通知 websocket close）| ~0~数秒 |
+| NAT 映射超时、中间设备丢包 | 传输层（ping timeout 20+25s）| 20~45s |
+| Node.js 进程 GC STW、事件循环阻塞 | 应用层 slowcommit | 5~23s（比传输层快）|
+| Socket 通着但服务端 pad 协程挂死 | 应用层 slowcommit | 21~23s |
+| 首屏 handshake 时服务端 accept 后静默 | 应用层 initsocketfail | 20s |
+
+两层叠加之后，"看似连上了但其实协作死了"这种最讨厌的灰色状态被极大缩短。
+
+---
+
+## 十、边界与退化分支详解
+
+### 10.1 闸门（isPendingRevision）期间：新协作改动是排队，不会丢
+
+`isPendingRevision` 只**阻塞发送**，不阻塞用户打字的累积。具体两条独立路径：
+
+**路径 A：本地打字如何累积（完全不受闸门影响）**
+
+调用链：
+```
+用户按键 → ace2_inner 的 onMutation/onInput 回调
+  → editorInfo.ace_composeUserChangeset(c)
+    → changesettracker.composeUserChangeset(c)  [changesettracker.ts:91-98]
+        if (applyingNonUserChanges) return;   // 外部 changeset 正在应用，防止递归
+        if (isIdentity(c)) return;
+        userChangeset = compose(userChangeset, c, apool);   // ← 永远会执行
+        setChangeCallbackTimeout();   // 调度下一次 handleUserChanges(0ms)
+```
+
+→ **结论：闸门期间，每一次按键都会正常 compose 到 userChangeset 上排队，数据不丢。**
+
+**路径 B：handleUserChanges 的发送逻辑被闸门挡住**
+
+[collab_client.ts:131-152](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/static/js/collab_client.ts#L131-L152)：
+```
+if (!isPendingRevision) {
+  prepareUserChangeset() → sendMessage(USER_CHANGES)    ← 闸门关闭（false）时才发送
+  sentMessage = true
+} else {
+  setTimeout(handleUserChanges, 3000);   ← 闸门打开（true）时每 3s 重试一次
+}
+```
+
+→ **结论：发送被无限重试排队，直到闸门关闭。闸门一关闭（false），立即走 L458-459 的副作用：**
+```
+if (wasPending && !value) {
+  handleUserChanges();   // 把 userChangeset 整个 prepare 并发出
+}
+```
+
+所以闸门期间，屏幕上的用户编辑 **既在内存里存在（userChangeset），又会在闸门关闭的第一刻自动发出去**——这就是"温和重连"能无缝恢复的原因。
+
+### 10.2 服务端 handleClientReady 的退化分支
+
+在 [PadMessageHandler.ts:1208-1269](file:///d:/fz/0601-2/solo-dogfeeding/code/75-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1208-L1269) 的 reconnect 分支里，包含三层防御性钳制，以及一层并发防御：
+
+#### 10.2.1 client_rev 越界
+
+```
+startNum = message.client_rev + 1
+endNum   = pad.getHeadRevisionNumber() + 1
+
+// 钳制 1：client_rev < -1 时（比如客户端传了非法极小值），startNum 不能低于 0
+if (startNum < 0) startNum = 0;    // [L1231-1233]
+
+// 钳制 2：在拉取 revisionsNeeded 的 await 期间，若有新编辑推进 head，endNum 可能超过新 head+1
+if (endNum > headNum + 1) endNum = headNum + 1;   // [L1227-1229]
+
+// 退化：client_rev >= headNum（和服务器同步 / 或客户端乱填超大数）→ startNum === endNum
+if (startNum === endNum) {
+  socket.emit('message', {
+    type: 'COLLABROOM',
+    data: { type: 'CLIENT_RECONNECT', noChanges: true, newRev: headNum }
+  });
+}
+```
+
+→ **结论：无论客户端的 client_rev 乱填成什么，服务端都不会崩。**
+- `client_rev < -1` → 从 rev=0 开始补整个 pad 历史（最坏情况，慢但正确）
+- `client_rev >= headNum` → 发 noChanges=true，直接让客户端解封，从"此刻"的 head 开始继续同步
+
+#### 10.2.2 并发 head 变化防御
+
+注意代码里 `headNum` 在循环外赋值（L1225）、`endNum` 在循环外算一次后又和 L1227 的新 `pad.getHeadRevisionNumber()` 对比钳制——但下发 CLIENT_RECONNECT 消息时每条的 `headRev` 却是**在发送循环里实时取** `pad.getHeadRevisionNumber()`（L1254）：
+
+```
+for (const r of revisionsNeeded) {
+  wireMsg = { ... headRev: pad.getHeadRevisionNumber(), newRev: r, ... };
+  socket.emit('message', wireMsg);
+}
+```
+
+这意味着：如果在逐条发送的过程中又有新的协作者推进了修订号，每条消息带上的 `headRev` 会变大，客户端要等到新 head 对应的那条 CLIENT_RECONNECT 也收到之后才会解封 isPendingRevision。对客户端来说看起来是"多等几秒补完新增的几条"，但正确性不受影响。
+
+#### 10.2.3 异步等待期间客户端断线
+
+在所有 await 之前（L1170）有一道检查：
+```
+if (sessionInfo !== sessioninfos[socket.id]) throw new Error('client disconnected');
+```
+
+因为整个 handleClientReady 是 async，中间有多次 `await padManager.getPad()` / `await Promise.all(revisionsNeeded.map(...))`。如果客户端在等待期间彻底断线且 socket.id 对应的 sessioninfos 被覆写，这道检查就会抛出，提前终止后续消息下发，避免往死连接里 emit。
+
+#### 10.2.4 客户端 newRev 校验只 warn、不抛
+
+在客户端接收 NEW_CHANGES / ACCEPT_COMMIT / CLIENT_RECONNECT 时都有类似校验：
+```
+if (newRev !== (rev + 1)) {
+  window.console.warn(`bad message revision on NEW_CHANGES: ${newRev} not ${rev + 1}`);
+  // setChannelState("DISCONNECTED", "badmessage_newchanges");  ← 被注释掉！
+  return;
+}
+```
+
+代码保留了注释掉的 setChannelState 调用，意味着**设计上有意选择"容忍单条坏消息、继续尝试后续消息"而非强断开**。这样做的理由：
+- 并发场景下如果服务端在 CLIENT_RECONNECT 发完之前又有新的 NEW_CHANGES 广播，可能出现"CLIENT_RECONNECT 中 newRev 跳号 + NEW_CHANGES 先一步到达"交织的情况，跳过继续等后续消息最终还能对齐；
+- 若真的是坏消息，后续要么 slowcommit 超时、要么用户手动 refresh，同样有兜底。
+
+这也是第七节时序图末尾提到的"出错时尽量保可用、不直接崩"设计哲学的一部分。
