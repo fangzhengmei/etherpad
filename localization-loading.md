@@ -199,6 +199,37 @@ html10n.mt.bind('localized', () => {
 
 当管理员为某个 Pad 全局设置了语言后，会通过 Socket.io 的 `CLIENT_VARS` 消息下发到 `clientVars.padOptions.lang`。
 
+**它不是走 URL `?lang=` 参数解析，而是走 `getParams()` 的 padOptions 合并应用机制** [pad.ts#L196-L216](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L196-L216)：
+
+```typescript
+const getParams = () => {
+  const params = getUrlVars();
+
+  for (const setting of getParameters) {
+    // URL query params take priority over server-enforced options.
+    // This prevents race conditions where both fire async callbacks
+    // (e.g., lang setting triggers html10n.localize twice).
+    const urlValue = params.get(setting.name);
+    if (urlValue && (urlValue === setting.checkVal || setting.checkVal == null)) {
+      setting.callback(urlValue, true);
+      continue;
+    }
+
+    // Fall back to server-enforced option
+    let serverValue = clientVars.padOptions[setting.name];
+    if (serverValue == null) continue;
+    serverValue = serverValue.toString();
+    if (serverValue === setting.checkVal || setting.checkVal == null) {
+      setting.callback(serverValue, false);
+    }
+  }
+};
+```
+
+`getParameters` 数组中包含 `'lang'` 项 [pad.ts#L184-L193](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L184-L193)，callback 触发 `html10n.localize([val, 'en'])` 并写 Cookie。调用时机在 `_afterHandshake()` 中 [pad.ts#L699](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L699)，在 `handshake()` 收到 `CLIENT_VARS` 之后。URL 参数优先级高于 padOptions，注释明确说明这是为了防止两者同时触发 `localize` 造成竞态。
+
+此外在运行时通过 `applyOptionsChange()` 也会合并应用：
+
 读取路径 [pad.ts#L559-L567](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad.ts#L559-L567)：
 ```typescript
 const effectiveOptions = $.extend(true, {}, pad.padOptions);
@@ -758,5 +789,8 @@ t('admin_pads.count_pads', {count: pads.length});
 | **Pad 编辑器 UI** | [src/static/js/pad_editor.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_editor.ts) | `#languagemenu` / `#padsettings-languagemenu` 事件绑定、`localized` 事件中 `<input>` 占位翻译 |
 | **聊天消息翻译** | [src/static/js/chat.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/chat.ts) | 新消息增量翻译 |
 | **断线重连翻译** | [src/static/js/pad_automatic_reconnect.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_automatic_reconnect.ts) | 模态框增量翻译 |
+| **导入导出按钮翻译** | [src/static/js/pad_impexp.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_impexp.ts) | `localized` 事件中重拉翻译字串 |
+| **视图模式按钮翻译** | [src/static/js/pad_mode.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_mode.ts) | `localized` 事件中重拉 title/aria-label |
+| **用户列表在线人数翻译** | [src/static/js/pad_userlist.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/static/js/pad_userlist.ts) | `localized` 事件中重拉 aria-label |
 | **核心语言资源（英文基准）** | [src/locales/en.json](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/src/locales/en.json) | 所有翻译 key 的基准定义 |
 | **Admin SPA i18n** | [admin/src/localization/i18n.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/76-etherpad-lite/admin/src/localization/i18n.ts) | i18next 初始化 + LazyImportPlugin |
