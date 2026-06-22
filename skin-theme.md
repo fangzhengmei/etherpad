@@ -722,3 +722,354 @@ if (window.clientVars.enableDarkMode) {   // ← 同样不检查 skinName
 3. **考虑补写防白闪脚本**：如果你自己实现了深色配色，又想避免首帧白闪——由于 `darkColor` 间接守卫了内联 IIFE 的输出，你需要在 SkinColors 里让 `darkToolbarColor()` 对你的皮肤返回非 null，或者把防白闪逻辑改写到你自己的 skin 模板里（但目前模板系统不支持 skin 覆盖 pad.html）。
 
 4. **处理 Dark Mode Toggle 的误导性**：非 colibris 但 enableDarkMode=true 时，用户仍然**看得见** Dark Mode checkbox（[pad.ts#L767](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L767)）。如果你的皮肤根本不支持暗配色，最直接的做法是把 `enableDarkMode` 设成 `false`，checkbox 就会彻底隐藏，避免给用户"选项存在但没用"的挫败感。
+
+---
+
+## 十、enableDarkMode × skinName 的四种组合全链路交叉分析
+
+主题装配系统有两个相互独立但有交叉影响的配置开关：
+
+| 开关 | 取值空间 | 说明 |
+|---|---|---|
+| **`enableDarkMode`** | `true` / `false`（默认 `true`） | 服务端 Settings 字段；控制"Dark Mode 自动切换"整套功能是否启用 |
+| **`skinName`** | `"colibris"` / 任意自定义名称（默认 `"colibris"`） | 皮肤目录名；控制 CSS/JS 资源路径 + toolbar 颜色真值表是否匹配 |
+
+两个开关 × 两个取值 = **4 种组合**，下面按 theme-color、内联预加载脚本、客户端自动切暗、设置面板 checkbox 四个观测点逐一拆解。
+
+### 10.1 enableDarkMode × skinName 的代码决策树
+
+在进入四种组合之前，先梳理两个开关**各自**能切断哪些链路，这样组合行为就可以通过布尔乘法推导：
+
+#### enableDarkMode 切断的代码路径（按执行顺序）
+
+```
+(1) 服务端 EJS 模板渲染 pad.html
+    │
+    ├─ [pad.html#L19] darkColor = settings.enableDarkMode
+    │                    ? skinColors.darkToolbarColor(...)
+    │                    : null
+    │
+    ├─ [pad.html#L57] if (configuredColor)
+    │                  <meta theme-color content=...
+    │                    if (darkColor) media="(prefers-color-scheme: light)"
+    │                  ↑ darkColor=null 时，亮 meta 不带 media 属性
+    │
+    ├─ [pad.html#L58] if (darkColor)
+    │                  <meta theme-color content=... media="(prefers-color-scheme: dark)"
+    │                  ↑ darkColor=null 时，暗 meta 彻底不输出
+    │
+    └─ [pad.html#L61] if (darkColor)
+                       <script> 内联 IIFE（防白闪）</script>
+                       ↑ darkColor=null 时，整段脚本不输出
+
+(2) 客户端 CLIENT_VARS 消息组装 [PadMessageHandler.ts#L1340]
+    └─ enableDarkMode: settings.enableDarkMode  原样传给浏览器
+
+(3) 客户端 pad.ts init()
+    ├─ [pad.ts#L764] 自动切暗：必须同时满足 clientVars.enableDarkMode 为 true
+    └─ [pad.ts#L767] 显示 checkbox：必须满足 clientVars.enableDarkMode 为 true
+```
+
+#### skinName 切断的代码路径
+
+```
+(1) 服务端 SkinColors 颜色解析
+    ├─ [SkinColors.ts#L14]  configuredToolbarColor()：非 colibris → null
+    └─ [SkinColors.ts#L29]  darkToolbarColor()：非 colibris → null
+    （这一步的 null 会通过 darkColor 变量和 §10.1.1 的 enableDarkMode 守卫叠加）
+
+(2) 服务端 pad.html 静态资源路径拼接
+    ├─ [pad.html#L93]  <link href="static/skins/<skinName>/pad.css">
+    └─ [pad.html#末尾] <script src="static/skins/<skinName>/pad.js">
+    （通用拼接，不做 colibris 判断，skinName 只影响路径）
+
+(3) 服务端 Skin Variants Builder 弹窗 DOM
+    └─ [pad.html#L658] if (settings.skinName == 'colibris') → 仅 colibris 输出
+
+(4) 客户端视觉效果
+    └─ 取决于 <skinName>/pad.css 是否定义了 .*-toolbar / .*-background / .*-editor
+       等 variant class 的 CSS 规则（不涉及 enableDarkMode）
+```
+
+### 10.2 四种组合速查表
+
+假设条件：`skinVariants = "super-light-toolbar super-light-editor light-background"`，系统 macOS 深色模式。
+
+| | **组合 A**<br>`colibris` + `enableDarkMode=true` | **组合 B**<br>`colibris` + `enableDarkMode=false` | **组合 C**<br>自定义（no-skin） + `enableDarkMode=true` | **组合 D**<br>自定义（no-skin） + `enableDarkMode=false` |
+|---|---|---|---|---|
+| **① theme-color meta** | ✅ 亮 `#ffffff` + `media="(prefers-color-scheme: light)"`<br>✅ 暗 `#485365` + `media="(prefers-color-scheme: dark)"` | ✅ 亮 `#ffffff`<br>❌ **不带 media**<br>❌ 暗 meta 不输出 | ❌ 完全无 meta | ❌ 完全无 meta |
+| **② 内联预加载 IIFE** | ✅ 输出（防白闪） | ❌ 不输出 | ❌ 不输出 | ❌ 不输出 |
+| **③ 客户端自动切暗** | ✅ 切暗 + 视觉生效 | ❌ 逻辑短路，不执行 | ⚠️ 逻辑执行，classList 变<br>但 CSS 无规则，视觉不变 | ❌ 逻辑短路，不执行 |
+| **④ 设置面板 Dark Mode checkbox** | ✅ 显示 + checked + 生效 | ❌ 隐藏 | ⚠️ 显示 + checked<br>但切换无视觉效果 | ❌ 隐藏 |
+| **⑤ #skinvariantsbuilder 弹窗** | ✅ DOM 存在 + 显示 + 生效 | ✅ DOM 存在 + 显示 + 生效（不依赖 enableDarkMode） | ❌ DOM 不存在 | ❌ DOM 不存在 |
+| **⑥ favicon / robots** | ✅ 标准 fallback 链 | ✅ 标准 fallback 链 | ✅ 标准 fallback 链 | ✅ 标准 fallback 链 |
+| **⑦ CSS / JS 资源加载** | ✅ `skins/colibris/pad.css|js` | ✅ `skins/colibris/pad.css|js` | ✅ `skins/no-skin/pad.css|js`（pad.css 空文件） | ✅ `skins/no-skin/pad.css|js` |
+| **⑧ 首帧视觉效果** | 暗色（IIFE 先改 class，CSS 随后加载） | 亮配色（设置里的 super-light-* 生效） | 亮配色（无 IIFE，默认 class 生效；CSS 空） | 亮配色（同上） |
+
+### 10.3 组合 A：colibris + enableDarkMode=true（默认出厂配置）
+
+完整流程在 §八 和 §九已经详细拆解，这里只给最简洁的链路：
+
+```
+Server:
+  enableDarkMode=true, skinName=colibris
+    → configuredColor = "#ffffff", darkColor = "#485365"
+    → pad.html 输出双 <meta theme-color> + 内联 IIFE
+
+Client:
+  CLIENT_VARS.enableDarkMode = true
+    → pad.ts#L764 条件满足：updateSkinVariantsClasses(dark classes)
+    → pad.ts#L767 条件满足：checkbox 显示 + checked
+  切 checkbox → pad_editor.ts#L140 事件绑定 → 正常亮/暗切换
+  #skinvariantsbuilder → pad.html#L658 条件满足 → DOM 渲染 + 生效
+```
+
+**关键点**：双 `<meta>` + `media` 属性 + 内联 IIFE 三者配合，iOS Safari 首帧即正确暗色，零白闪。
+
+### 10.4 组合 B：colibris + enableDarkMode=false
+
+这是**最容易被忽略的组合**，因为 enableDarkMode=false 时 theme-color 的输出不是"完全没了"，而是**降级为单 meta**。
+
+#### 10.4.1 theme-color：单 meta，不带 media
+
+决策链：
+
+```
+pad.html#L18: configuredColor = configuredToolbarColor("colibris", skinVariants)
+              → "#ffffff"  (因为 colibris，能查表)
+pad.html#L19: darkColor      = settings.enableDarkMode ? darkToolbarColor("colibris") : null
+                           = false ? "#485365" : null
+                           = null
+
+pad.html#L57: if (configuredColor) → true
+                <meta name="theme-color" content="#ffffff"
+                <% if (darkColor) { %> media="(prefers-color-scheme: light)"<% } %>
+                ↑ darkColor=null → 不输出 media 属性 →
+                最终：<meta name="theme-color" content="#ffffff">
+
+pad.html#L58: if (darkColor) → false
+                暗 meta 完全不输出
+```
+
+**结果**：只输出一个 `<meta name="theme-color" content="#ffffff">`，没有任何 `media` 属性。无论系统偏好是亮还是暗，移动端地址栏都是白色。
+
+**和组合 A 的区别**：
+- 组合 A 有两个 meta，iOS Safari 在 HTML 解析时根据 `prefers-color-scheme` 二选一
+- 组合 B 只有一个 meta，iOS Safari 无条件用 `#ffffff`
+
+#### 10.4.2 内联预加载 IIFE：完全不输出
+
+```
+pad.html#L61: <% if (darkColor) { %> ... IIFE ... <% } %>
+              darkColor=null → 整段脚本不输出
+```
+
+**结果**：没有防白闪脚本。即使系统是深色模式，`<html>` 在 CSS 加载之前保持服务端写入的亮配色 class（`super-light-toolbar super-light-editor light-background`），首帧亮底。
+
+#### 10.4.3 客户端自动切暗：逻辑短路
+
+[pad.ts#L764](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L764) 的四个条件里 `window.clientVars.enableDarkMode` 是 `false` → `&&` 短路 → 整段不执行。`updateSkinVariantsClasses()` 不会被调用。
+
+**结果**：`<html>` class 始终等于服务端写入的默认值，不会被自动切暗。
+
+#### 10.4.4 设置面板 checkbox：隐藏
+
+[pad.ts#L767](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L767) 的 `if (window.clientVars.enableDarkMode)` 为 false → 不执行 `.prop('hidden', false)` → `<p id="theme-toggle-row">` 保持模板里默认的 `hidden` 属性（[pad.html#L303](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html#L303)）。
+
+**结果**：用户完全看不到 Dark Mode 的开关。
+
+#### 10.4.5 Skin Variants Builder：完全不受影响
+
+`#skinvariantsbuilder` 弹窗的 DOM 守卫在 [pad.html#L658](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html#L658)：
+
+```ejs
+<% if (settings.skinName == 'colibris') { %>
+```
+
+这层判断**只看 skinName**，和 enableDarkMode 完全无关。所以即使用户关了 enableDarkMode，只要 skinName 是 colibris，访问 `/p/test#skinvariantsbuilder` 依然能看到弹窗，且弹窗的下拉框切换依然能调用 `updateSkinVariantsClasses()` 改变配色。
+
+**这是一个有趣的交叉行为**：管理员关了 enableDarkMode（不希望普通用户自动切暗），但 Skin Variants Builder 仍然可以手动选择 dark 变体。两者在代码里是完全独立的通道：
+
+| 通道 | 守卫开关 |
+|---|---|
+| 自动切暗 + checkbox | `enableDarkMode` |
+| Skin Variants Builder 手动选变体 | `skinName == 'colibris'` |
+
+### 10.5 组合 C：自定义皮肤 + enableDarkMode=true（最"迷惑"的组合）
+
+核心现象：enableDarkMode 打开了，但因为 skinName 非 colibris 导致 `configuredColor` 和 `darkColor` 全为 null，**theme-color + 预加载 IIFE 都消失了**；而客户端的 `clientVars.enableDarkMode` 又为 true，**自动切暗逻辑照常执行 + checkbox 照常显示**。
+
+#### 10.5.1 theme-color + 预加载 IIFE：双双消失
+
+```
+pad.html#L18: configuredColor = configuredToolbarColor("no-skin", ...)
+              → SkinColors.ts#L14: "no-skin" !== "colibris" → return null
+pad.html#L19: darkColor      = enableDarkMode=true ? darkToolbarColor("no-skin") : null
+                            = darkToolbarColor("no-skin")
+                            → SkinColors.ts#L29: "no-skin" !== "colibris" → return null
+
+pad.html#L57: configuredColor=null → 亮 meta 不输出
+pad.html#L58: darkColor=null → 暗 meta 不输出
+pad.html#L61: darkColor=null → IIFE 不输出
+```
+
+**结果**：移动端地址栏用浏览器默认色（通常白色），首帧无防白闪。
+
+#### 10.5.2 客户端自动切暗：逻辑执行但视觉空操作
+
+服务端在组装 CLIENT_VARS 时（[PadMessageHandler.ts#L1333-L1340](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/node/handler/PadMessageHandler.ts#L1333-L1340)）：
+
+```typescript
+const clientVars = {
+  skinName: settings.skinName,          // "no-skin"
+  skinVariants: settings.skinVariants,
+  randomVersionString: ...,
+  accountPrivs: ...,
+  enableDarkMode: settings.enableDarkMode, // true
+  ...
+};
+```
+
+`enableDarkMode` 字段**完全独立于 skinName** 赋值，不做任何交叉判断。所以客户端收到的 `clientVars.enableDarkMode` 还是 `true`。
+
+接下来的客户端逻辑和组合 A 完全相同：
+
+```
+pad.ts#L764 条件全满足 → updateSkinVariantsClasses(dark classes)
+  → 6 个 DOM 根 remove 所有 variant class
+  → 6 个 DOM 根 add 'super-dark-editor dark-background super-dark-toolbar'
+  → updateThemeColorMeta(dark classes)
+     → document.querySelectorAll('meta[name="theme-color"]')
+     → 长度为 0 → 提前 return，什么都不做
+```
+
+**最终效果**：`html` 等节点的 classList 确实被改成了暗色值，但 `no-skin/pad.css` 是空文件，没有任何 `.super-dark-toolbar .toolbar { ... }` 规则 → **视觉零变化**。
+
+#### 10.5.3 设置面板 checkbox：显示但切换无效
+
+```
+pad.ts#L767: if (window.clientVars.enableDarkMode) → true
+  → $('#theme-toggle-row').prop('hidden', false) → checkbox 显示
+  → $('#options-darkmode').prop('checked', skinVariants.isDarkMode())
+  → isDarkMode() 检查 html.super-dark-editor → 前一步自动切暗已加了 class → true
+```
+
+用户点击 checkbox：
+
+```
+pad_editor.ts#L140-L150: 事件已绑定（pad_editor.ts 在 padBootstrap.js 里 require 加载，
+                        整个模块不做 enableDarkMode 判断，事件绑定无条件执行）
+  → setDarkModeInLocalStorage(true/false)  写入 localStorage
+  → updateSkinVariantsClasses(...)         同 10.5.2，视觉零效果
+```
+
+**最终效果**：checkbox 看得见、能点、checked 状态会变、localStorage 也会写，但页面颜色**完全不变**。用户体验是"这个开关坏了"。
+
+#### 10.5.4 Skin Variants Builder：DOM 不存在
+
+由 [pad.html#L658](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html#L658) 的硬编码守卫控制，和 enableDarkMode 无关。skinName 不是 colibris → 整个 `<div id="skin-variants">` 不写入 DOM。
+
+### 10.6 组合 D：自定义皮肤 + enableDarkMode=false（最干净的组合）
+
+这是组合 C 的"修复版"——关掉 enableDarkMode 后，客户端自动切暗逻辑被短路、checkbox 被隐藏，消除了组合 C 的 UX 陷阱。
+
+#### 10.6.1 theme-color + 预加载 IIFE：仍然双双消失
+
+和组合 C 完全相同。因为 `configuredColor` / `darkColor` 是否为 null，决定于 `SkinColors.ts` 里的 `skinName !== 'colibris'` 守卫，和 enableDarkMode 无关：
+
+```
+configuredColor = configuredToolbarColor("no-skin", ...) → null
+darkColor      = enableDarkMode=false ? ... : null      → null
+
+→ 两个 meta 都不输出
+→ IIFE 不输出
+```
+
+**注意**：enableDarkMode 从 true→false 的切换**不会改变 theme-color 的输出结果**，因为 configuredColor 已经是 null 了。这里 enableDarkMode 的作用被短路。
+
+#### 10.6.2 客户端自动切暗：逻辑短路
+
+```
+clientVars.enableDarkMode = false
+→ pad.ts#L764 的 && 短路 → 不执行 updateSkinVariantsClasses()
+```
+
+`<html>` 的 class 保持服务端写入的默认值。
+
+#### 10.6.3 设置面板 checkbox：隐藏
+
+```
+clientVars.enableDarkMode = false
+→ pad.ts#L767 的 if 不满足 → #theme-toggle-row 保持 hidden
+```
+
+用户完全看不到 Dark Mode 开关。组合 C 的 UX 陷阱被消除。
+
+#### 10.6.4 Skin Variants Builder：DOM 不存在
+
+同组合 C，由 skinName 控制。
+
+### 10.7 enableDarkMode 的完整传播链（从 settings.json 到浏览器）
+
+```
+settings.json
+  └─ "enableDarkMode": true/false
+       │
+       ▼
+Settings.ts 定义默认值 + 加载
+  ├─ [Settings.ts#L435]    默认值 = true
+  ├─ [Settings.ts#L177]    类型声明 enableDarkMode: boolean
+  └─ [Settings.ts#L876]    getPublicSettings() 暴露给模板的字段
+       │
+       ├───────────────────────────────────────────────┐
+       │                                               │
+       ▼                                               ▼
+服务端模板渲染                                        CLIENT_VARS 消息组装
+  ├─ pad.html#L19: darkColor = enableDarkMode           [PadMessageHandler.ts#L1340]
+  │                  ? darkToolbarColor(...) : null        clientVars.enableDarkMode =
+  ├─ pad.html#L57: 双 meta 的 media 属性                   settings.enableDarkMode (原封不动)
+  ├─ pad.html#L58: 暗 meta 是否输出
+  ├─ pad.html#L61: 内联 IIFE 是否输出                      │
+  └─ timeslider.html 同理                                  ▼
+                                                        pad.ts 客户端逻辑
+                                                          ├─ L764: 自动切暗守卫
+                                                          └─ L767: checkbox 显示守卫
+```
+
+### 10.8 关键交叉点的代码注释解读
+
+为什么 `enableDarkMode` 的行为会和 `skinName` 出现这么复杂的交叉？因为代码里有两处设计意图的碰撞：
+
+1. **SkinColors 的 colibris 守卫**（[SkinColors.ts#L5-L9](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/node/utils/SkinColors.ts#L5-L9)）：
+
+   > "Only the colibris skin has a known mapping... For any other skin we cannot derive the toolbar color server-side and return null so callers can omit the meta rather than emit a misleading value."
+
+   这是一种"**宁可不输出也不输出错误值**"的防御性设计。
+
+2. **pad.html 用 darkColor 同时守卫两件事**（[pad.html#L15-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html#L15-L19) 注释）：
+
+   > "The dark variant is only emitted when enableDarkMode is on, since that is what gates the client-side auto-switch..."
+
+   darkColor 的存在性同时意味着：
+   - (a) skinName 是 colibris（由 SkinColors 保证）
+   - (b) enableDarkMode 是 true（由三元表达式保证）
+
+   所以它被拿来同时当**暗 meta 的守卫**和**防白闪 IIFE 的守卫**。这种"一个变量兼两职"的写法让非 colibris + enableDarkMode=true 的组合出现了看似"enableDarkMode 没生效"的错觉——实际上 enableDarkMode=true 了，但 darkColor 被 skinName 的守卫短路成了 null。
+
+3. **客户端完全不看 skinName**（[pad.ts#L764-L770](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L764-L770)）：
+
+   客户端的 4 个判断条件里完全没有 `clientVars.skinName`。这意味着：
+   - 服务端可以通过 `SkinColors` 决定"不输出 theme-color 和 IIFE"
+   - 但客户端依然会忠实执行自动切暗 + 显示 checkbox 的逻辑
+   
+   这个设计分割就是组合 C 出现"checkbox 显示但切换无效"的根本原因。
+
+### 10.9 给运维的配置建议（四种组合怎么选）
+
+| 场景 | 推荐组合 | 理由 |
+|---|---|---|
+| **默认，啥都不改** | A: colibris + enableDarkMode=true | 官方预期行为，体验最佳 |
+| **组织内网、强制统一亮色、不希望用户切暗** | B: colibris + enableDarkMode=false | checkbox 隐藏，用户看不到选项；但 theme-color 仍有亮 meta |
+| **自定义皮肤 + 该皮肤自带完整 variant CSS** | C-修复: 自定义 + enableDarkMode=true **+** 自行扩展 SkinColors 让 theme-color/IIFE 输出 + 补全 variant CSS | 不建议裸用组合 C，会有 UX 陷阱 |
+| **自定义皮肤 + 该皮肤完全不支持暗配色** | D: 自定义 + enableDarkMode=false | 最干净：checkbox 隐藏、自动切暗不触发，消除所有 UX 陷阱 |
+| **自定义皮肤 + 该皮肤想自己实现暗模式机制（不依赖 variant class）** | D: 自定义 + enableDarkMode=false | 关闭系统默认机制，自己在 pad.js 的 customStart() 里实现；同时建议自写 theme-color meta |
