@@ -1073,3 +1073,348 @@ Settings.ts 定义默认值 + 加载
 | **自定义皮肤 + 该皮肤自带完整 variant CSS** | C-修复: 自定义 + enableDarkMode=true **+** 自行扩展 SkinColors 让 theme-color/IIFE 输出 + 补全 variant CSS | 不建议裸用组合 C，会有 UX 陷阱 |
 | **自定义皮肤 + 该皮肤完全不支持暗配色** | D: 自定义 + enableDarkMode=false | 最干净：checkbox 隐藏、自动切暗不触发，消除所有 UX 陷阱 |
 | **自定义皮肤 + 该皮肤想自己实现暗模式机制（不依赖 variant class）** | D: 自定义 + enableDarkMode=false | 关闭系统默认机制，自己在 pad.js 的 customStart() 里实现；同时建议自写 theme-color meta |
+
+---
+
+## 十一、`localStorage.ep_darkMode` 三态 × 双开关的优先级与最终表现
+
+`localStorage.ep_darkMode` 这个键看似只有"true/false"布尔，实际在代码里是**三态**的：
+
+| 状态 | `localStorage.getItem('ep_darkMode')` 返回值 | 典型场景 |
+|---|---|---|
+| **unset（未设置）** | `null`（JS 原生返回值，不是字符串） | 首次访问 / 清了浏览器缓存 / 从不使用 Dark Mode 开关 |
+| **显式 true** | 字符串 `"true"` | 用户勾选了 Dark Mode checkbox |
+| **显式 false** | 字符串 `"false"` | 用户取消勾选了 Dark Mode checkbox（覆盖系统暗色偏好） |
+
+三种状态在四个观测节点上的行为完全不同，且会和 `enableDarkMode`、`skinName` 两个开关交叉叠加。下面按执行顺序逐节点拆解。
+
+### 11.1 四个观测节点的执行顺序（时间线）
+
+一次典型的 Pad 页面加载，主题相关代码按以下顺序触发：
+
+```
+T1  服务端 EJS 渲染 pad.html
+      ├─ 计算 configuredColor / darkColor（受 skinName + enableDarkMode 影响）
+      ├─ 输出 <meta theme-color>（0/1/2 个，视 darkColor 而定）
+      └─ 若 darkColor != null，输出内联 IIFE（含 localStorage 判断）
+         ↑ T2 执行点
+
+T2  浏览器解析到 <head> 里的内联 IIFE（如果存在）
+      └─ 检查 hash、localStorage.ep_darkMode、matchMedia
+         → 命中条件则提前把 <html> 改成暗色 class
+         ↑ 防白闪的关键，发生在 CSS 加载之前
+
+T3  CSS 加载、DOM Ready、padBootstrap 执行 → pad.ts init()
+      ├─ pad.ts#L764: 客户端自动切暗逻辑
+      │              （再次检查 localStorage + matchMedia + enableDarkMode）
+      └─ pad.ts#L767: checkbox 显示/隐藏 + 初始 checked 状态
+                      （checked 取决于 isDarkMode()，即 html.super-dark-editor）
+
+T4  用户手动点击 #options-darkmode checkbox（如果显示）
+      └─ pad_editor.ts#L140: 事件绑定
+         ├─ setDarkModeInLocalStorage(true/false)  → 写入 localStorage
+         └─ updateSkinVariantsClasses(...)           → 改 DOM class + 调 updateThemeColorMeta
+```
+
+**关键点**：T1（服务端）→ T2（内联脚本）→ T3（客户端 init）→ T4（用户交互）是严格时序。T2 早于 CSS 加载，所以它能真正"防白闪"；T3 晚于 DOM Ready，主要负责 iframe 同步和 checkbox 状态；T4 只在用户操作时发生。
+
+### 11.2 localStorage 三态在各节点的判断逻辑
+
+先逐个节点看 localStorage 三个取值分别如何被判定。
+
+#### 节点 T2：内联预加载 IIFE（仅 darkColor != null 时才会出现在 HTML 中）
+
+代码位置：[pad.html#L69-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html#L69-L85)（timeslider 同构）
+
+```javascript
+(function () {
+  try {
+    if (window.location.hash.toLowerCase() === '#skinvariantsbuilder') return;
+    if (localStorage.getItem('ep_darkMode') === 'false') return;   // ★ 三态判断 1
+    if (!(window.matchMedia &&
+          window.matchMedia('(prefers-color-scheme: dark)').matches)) return;
+    // ... 改 <html> 为暗色 class
+  } catch (e) { /* fall back to light */ }
+})();
+```
+
+| `ep_darkMode` 值 | `getItem() === 'false'` | 结果 |
+|---|---|---|
+| `null`（unset） | `false`（null !== 'false'） | 不 return，继续判断 matchMedia |
+| `"true"` | `false`（"true" !== 'false'） | 不 return，继续判断 matchMedia |
+| `"false"` | `true` | 直接 return → 保持亮色，不切暗 |
+
+**关键洞察**：这个判断只检查 **`=== 'false'`**，不检查 `=== 'true'`。也就是说——
+
+> **内联 IIFE 只尊重"用户显式选了亮"这一种覆盖**。`"true"` 和 unset 都走"跟随系统偏好"。
+
+这是有意设计：用户若从没碰过开关（unset）或主动勾选了暗色（`"true"`），两种情况都应该让 `matchMedia` 决定。只有用户**主动取消勾选**（`"false"`）才要强制覆盖系统偏好。
+
+#### 节点 T3：pad.ts 客户端自动切暗
+
+代码位置：[pad.ts#L764-L766](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L764-L766)
+
+```typescript
+if (window.location.hash.toLowerCase() !== '#skinvariantsbuilder'
+    && window.clientVars.enableDarkMode                                 // ★ 守卫 1
+    && (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+    && !skinVariants.isWhiteModeEnabledInLocalStorage()) {              // ★ 三态判断 2
+  skinVariants.updateSkinVariantsClasses([
+    'super-dark-editor', 'dark-background', 'super-dark-toolbar'
+  ]);
+}
+```
+
+其中 `isWhiteModeEnabledInLocalStorage()` 定义在 [skin_variants.ts#L75-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L75-L77)：
+
+```typescript
+const isWhiteModeEnabledInLocalStorage = () => {
+  return localStorage.getItem('ep_darkMode') === 'false';
+};
+```
+
+和 T2 的内联 IIFE **完全相同的判断逻辑**（也只检查 `=== 'false'`）。这是刻意保持一致的镜像设计，T2 和 T3 的结果始终一致，不会出现"T2 切了暗但 T3 又切回来"的情况。
+
+| `ep_darkMode` 值 | `isWhiteModeEnabledInLocalStorage()` | `!该值`（即 if 条件的第四项） |
+|---|---|---|
+| `null`（unset） | `false` | `true` → 通过 |
+| `"true"` | `false` | `true` → 通过 |
+| `"false"` | `true` | `false` → 不通过，保持亮色 |
+
+**另外**，T3 比 T2 多了 `clientVars.enableDarkMode` 这个守卫——T2 存在的前提是 darkColor != null（间接要求 enableDarkMode=true），而 T3 直接用 enableDarkMode 守卫。
+
+#### 节点 T3：checkbox 显示与初始 checked 状态
+
+代码位置：[pad.ts#L767-L770](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad.ts#L767-L770)
+
+```typescript
+if (window.clientVars.enableDarkMode) {            // 只看 enableDarkMode
+  $('#theme-toggle-row').prop('hidden', false);    // 显示 checkbox
+  $('#options-darkmode').prop(
+    'checked',
+    skinVariants.isDarkMode()                      // ★ 不直接读 localStorage
+  );
+}
+```
+
+这里的设计比较微妙：**checked 状态不直接读 localStorage.ep_darkMode**，而是读 `isDarkMode()`（[skin_variants.ts#L62-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L62-L64)）：
+
+```typescript
+const isDarkMode = () => {
+  return $('html').hasClass('super-dark-editor');
+};
+```
+
+也就是检查 `<html>` 上的 DOM class，而这个 class 是 T2（内联 IIFE）或 T3（自动切暗）加上去的。最终效果：
+
+| 场景 | `isDarkMode()` | checkbox checked |
+|---|---|---|
+| unset + 系统暗色 + enableDarkMode=true + colibris | `true`（T2 或 T3 加了 class） | ✅ checked |
+| unset + 系统亮色 | `false`（没人加 class） | ⬜ 未勾选 |
+| `"true"` + 系统暗色 | `true` | ✅ checked |
+| `"true"` + 系统亮色 | `false`（T2/T3 的 matchMedia 条件不满足，不切暗） | ⬜ 未勾选 |
+| `"false"`（任何系统偏好） | `false`（T2/T3 都被 return） | ⬜ 未勾选 |
+| enableDarkMode=false | 不执行这段 | hidden，用户看不到 |
+
+**注意 `ep_darkMode="true"` + 系统亮色这个边界情况**：用户显式勾选了暗色，但当前系统是亮色。由于 T2/T3 都要求 `matchMedia(dark).matches` 才会切暗，结果是 `<html>` 保持亮色 class → checkbox 显示未勾选。这个看似反直觉，但实际符合设计——`"true"` 的语义是"跟随系统暗色偏好"，不是"永远强制暗色"。代码里**没有**任何地方提供"强制覆盖系统为暗色"的持久化开关。
+
+#### 节点 T4：用户手动切换 checkbox
+
+代码位置：[pad_editor.ts#L140-L150](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/pad_editor.ts#L140-L150)
+
+```typescript
+padutils.bindCheckboxChange($('#options-darkmode'), () => {
+  const isDark = padutils.getCheckbox($('#options-darkmode'));
+  skinVariants.setDarkModeInLocalStorage(isDark);          // ★ 写 localStorage
+  if (isDark) {
+    skinVariants.updateSkinVariantsClasses([
+      'super-dark-editor', 'dark-background', 'super-dark-toolbar']);
+  } else {
+    skinVariants.updateSkinVariantsClasses(
+      ['super-light-toolbar super-light-editor light-background']);
+  }
+});
+```
+
+`setDarkModeInLocalStorage()` 定义在 [skin_variants.ts#L67-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L67-L69)：
+
+```typescript
+const setDarkModeInLocalStorage = (isDark) => {
+  localStorage.setItem('ep_darkMode', isDark ? 'true' : 'false');
+};
+```
+
+**这个节点是 localStorage 三态里 unset → "true"/"false" 的唯一写入点**。注意：
+- 没有 `removeItem()`，永远不会写回 unset
+- 用户第一次点 checkbox 之后，localStorage 状态就**永久锁定**在 `"true"` 或 `"false"`，除非手动清浏览器数据
+- 同时调用 `updateSkinVariantsClasses()` 立即改 DOM，不等下次刷新
+
+#### 节点 T2/T3/T4 共用：updateThemeColorMeta
+
+代码位置：[skin_variants.ts#L20-L25](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L20-L25)
+
+```typescript
+const updateThemeColorMeta = (newClasses: string[]) => {
+  const metas = document.querySelectorAll('meta[name="theme-color"]');
+  if (!metas.length) return;                                                 // ★ 守卫 1
+  const color = toolbarColorForTokens(
+    newClasses.join(' ').split(/\s+/).filter(Boolean));
+  metas.forEach((meta) => { meta.setAttribute('content', color); });         // ★ 全部 meta 都改
+};
+```
+
+这个函数只有**唯一的调用点**：`updateSkinVariantsClasses()` 的最后一行（[skin_variants.ts#L58](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L58)）。所以只要 DOM class 变化，theme-color meta 就会尝试同步。
+
+关键行为：
+
+1. **非 colibris 皮肤下静默失败**：`metas.length == 0`（因为 SkinColors 返回 null，T1 根本没输出 meta）→ 直接 return，不报错
+2. **colibris + enableDarkMode=true 时覆盖两个 meta 的 content**：服务端 T1 输出了两个 meta（各带 `media` 属性），`toolbarColorForTokens()` 根据当前 variant class 算出颜色后，**两个 meta 的 content 都被改成同一个值**。这样用户手动切亮/切暗时，不管浏览器当前匹配哪个 media 查询，都能看到正确颜色
+3. **colibris + enableDarkMode=false 时只改一个 meta**：T1 只输出了一个不带 media 的亮 meta，改它就够了
+
+`toolbarColorForTokens()`（[skin_toolbar_colors.ts#L24-L31](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_toolbar_colors.ts#L24-L31)）的逻辑是：遍历 `TOOLBAR_COLORS_IN_CSS_ORDER` 真值表（顺序和 CSS 级联一致），最后一个匹配的 *-toolbar token 获胜；如果没有匹配则返回默认 `#ffffff`。
+
+### 11.3 localStorage 三态 × enableDarkMode × skinName 的完整 24 格矩阵
+
+假设系统偏好为暗色（`matchMedia('(prefers-color-scheme: dark)').matches === true`），其他默认值，按执行顺序看最终表现：
+
+#### 组 A：skinName = colibris
+
+| `enableDarkMode` | `ep_darkMode` | T1 meta 输出 | T2 内联 IIFE | T3 自动切暗 | T3 checkbox 状态 | T4 可交互？ | T4 后 `updateThemeColorMeta` |
+|---|---|---|---|---|---|---|---|
+| **true** | `null`（unset） | 亮 `#ffffff` media=light<br>暗 `#485365` media=dark | ✅ 切暗（class + CSS 变量生效） | ✅ 再次切暗（幂等） | 显示 + checked | ✅ 可点，点后生效 | ✅ 双 meta content 同步改 |
+| **true** | `"true"` | 同上 | ✅ 切暗 | ✅ 切暗 | 显示 + checked | ✅ 可点，点后生效 | ✅ 同步改 |
+| **true** | `"false"` | 同上 | ❌ return，不切暗 | ❌ 第四项为 false，不切暗 | 显示 + 未 checked | ✅ 可点，点后生效 | ✅ 同步改 |
+| **false** | `null`（unset） | 亮 `#ffffff`，**无 media** | ⬜ IIFE 不存在（darkColor=null） | ❌ enableDarkMode=false，短路 | 隐藏 | ❌ 不可见 | ⬜ 无 T4 交互 |
+| **false** | `"true"` | 同上 | ⬜ IIFE 不存在 | ❌ 短路 | 隐藏 | ❌ 不可见 | ⬜ 无 T4 交互 |
+| **false** | `"false"` | 同上 | ⬜ IIFE 不存在 | ❌ 短路 | 隐藏 | ❌ 不可见 | ⬜ 无 T4 交互 |
+
+**组 A 观察点**：
+
+- enableDarkMode=true 时，`"false"` 是真正有区分度的状态——它强制保持亮，而 unset 和 `"true"` 都跟随系统暗色
+- enableDarkMode=false 时，localStorage 的三个值**对视觉完全没有影响**，因为 T2 IIFE 不输出、T3 自动切暗被短路、T4 checkbox 隐藏，localStorage 根本读不到
+- enableDarkMode=false 时 T1 只输出单 meta 不带 media，**且永远不会被 JS 改写**（因为 checkbox 隐藏，没有 T4 调用 `updateSkinVariantsClasses`，也就不会触发 `updateThemeColorMeta`）
+
+#### 组 B：skinName = 自定义（no-skin）
+
+| `enableDarkMode` | `ep_darkMode` | T1 meta 输出 | T2 内联 IIFE | T3 自动切暗 | T3 checkbox 状态 | T4 可交互？ | T4 后 `updateThemeColorMeta` |
+|---|---|---|---|---|---|---|---|
+| **true** | `null`（unset） | ❌ 无 meta（SkinColors 返回 null） | ⬜ IIFE 不存在（darkColor=null） | ✅ 改 classList，但 CSS 空 → 视觉零效果 | 显示 + checked（基于 class，和视觉不一致） | ✅ 可点，但切换无视觉变化 | ⬜ metas.length=0，静默 return |
+| **true** | `"true"` | ❌ 无 meta | ⬜ IIFE 不存在 | ✅ 改 classList，视觉零效果 | 显示 + checked | ✅ 可点，无视觉变化 | ⬜ 静默 return |
+| **true** | `"false"` | ❌ 无 meta | ⬜ IIFE 不存在 | ❌ isWhiteMode 为 true，不改 | 显示 + 未 checked | ✅ 可点，无视觉变化 | ⬜ 静默 return |
+| **false** | `null`（unset） | ❌ 无 meta | ⬜ IIFE 不存在 | ❌ enableDarkMode=false，短路 | 隐藏 | ❌ 不可见 | ⬜ 无 T4 交互 |
+| **false** | `"true"` | ❌ 无 meta | ⬜ IIFE 不存在 | ❌ 短路 | 隐藏 | ❌ 不可见 | ⬜ 无 T4 交互 |
+| **false** | `"false"` | ❌ 无 meta | ⬜ IIFE 不存在 | ❌ 短路 | 隐藏 | ❌ 不可见 | ⬜ 无 T4 交互 |
+
+**组 B 观察点**：
+
+- **T2 内联 IIFE 在自定义皮肤下永远不存在**，因为 `SkinColors.darkToolbarColor()` 对非 colibris 返回 null，darkColor 永远是 null → 守卫 `if (darkColor)` 永远不通过。这意味着在自定义皮肤 + enableDarkMode=true 组合下，防白闪机制完全失效
+- T3 的 checkbox checked 状态会出现"视觉与 checked 不一致"：`ep_darkMode=null` 时 T3 自动切暗把 `<html>` 加成 `super-dark-editor` → `isDarkMode()` 返回 true → checkbox 显示 checked，但因为 no-skin/pad.css 是空文件，视觉上是亮色
+- `updateThemeColorMeta` 在所有非 colibris 场景下都是**静默空操作**，因为 T1 没输出 meta，`metas.length === 0` 直接 return
+
+### 11.4 localStorage 三态的优先级总结
+
+从所有场景提炼出的**决策优先级**（从高到低）：
+
+```
+优先级 1：skinName !== 'colibris'
+           → theme-color: 无
+           → 内联 IIFE: 不输出（防白闪失效）
+           → updateThemeColorMeta: 空操作
+           （colibris 是整个系统的前置条件）
+
+优先级 2：enableDarkMode === false
+           → 内联 IIFE: 不输出（darkColor 三元返回 null）
+           → T3 自动切暗: 短路（&& 判断 clientVars.enableDarkMode）
+           → checkbox: 隐藏（用户根本碰不到）
+           （enableDarkMode 是客户端所有暗模式逻辑的总开关）
+
+优先级 3：localStorage.ep_darkMode === 'false'
+           → T2 IIFE: 直接 return，不切暗
+           → T3 自动切暗: !isWhiteModeEnabledInLocalStorage() 为 false，不切暗
+           （用户显式覆盖：我不管系统是不是暗色，我就要亮）
+
+优先级 4：matchMedia('(prefers-color-scheme: dark)').matches
+           → true: 切暗
+           → false: 保持亮
+           （只有前三个优先级都放行，才跟随系统）
+
+优先级 5：localStorage.ep_darkMode === 'true'
+           → 不影响当前会话的切暗决策（没有任何代码检查 === 'true'）
+           → 只在下次刷新、且 matchMedia 已经是 dark 时才"生效"
+           → 实际效果和 unset 完全相同
+```
+
+**最重要的两个反直觉结论**：
+
+1. **`"true"` 和 unset 语义完全相同**。代码里**没有任何地方**检查 `ep_darkMode === 'true'`，只检查 `=== 'false'`。`"true"` 的存在仅仅是为了"让 checkbox 在下次打开时保持选中状态"——但那个 checked 状态其实是靠 `isDarkMode()`（读 DOM class）间接算出来的，`"true"` 本身不驱动任何切暗逻辑。
+
+2. **`"true"` 不能强制亮系统为暗**。如果你在系统亮色时勾选了 Dark Mode checkbox：
+   - T4 会立刻调用 `updateSkinVariantsClasses(dark)` 改 DOM（这次生效）
+   - 同时写入 `ep_darkMode = "true"`
+   - 下次刷新时，T2（如果存在）和 T3 都会先检查 `matchMedia(dark).matches`，系统亮 → 不切暗
+   - 结果是你**刷新后又变回亮色**，即使 localStorage 里是 `"true"`
+
+### 11.5 localStorage 的所有读写点汇总
+
+| 位置 | 操作 | 触发时机 |
+|---|---|---|
+| [pad.html#L74](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/pad.html#L74) | `getItem('ep_darkMode') === 'false'`（只读） | T2 内联 IIFE，CSS 加载前（仅 colibris + enableDarkMode=true） |
+| [timeslider.html#L55](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/templates/timeslider.html#L55) | 同上 | T2 内联 IIFE，timeslider 页 |
+| [skin_variants.ts#L75-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L75-L77) | `getItem('ep_darkMode') === 'false'`（isWhiteModeEnabledInLocalStorage） | T3 pad.ts 自动切暗守卫 |
+| [skin_variants.ts#L71-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L71-L73) | `getItem('ep_darkMode') === 'true'`（isDarkModeEnabledInLocalStorage） | **导出但整个代码库零调用**（死代码？） |
+| [skin_variants.ts#L67-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L67-L69) | `setItem('ep_darkMode', 'true' | 'false')`（setDarkModeInLocalStorage） | T4 用户点 checkbox 时写入 |
+
+**特别注意**：`isDarkModeEnabledInLocalStorage()`（检查 `=== 'true'`）这个函数在 [skin_variants.ts#L119](file:///d:/fz/0601-2/solo-dogfeeding/code/77-etherpad-lite/src/static/js/skin_variants.ts#L119) 被导出，但整个代码库里**没有任何 import 或调用**——它是遗留或预留接口，目前所有判断都只看 `=== 'false'`。这进一步印证了结论 1：`"true"` 在当前版本里不起任何直接驱动作用。
+
+### 11.6 完整状态流转图（从用户首次访问起）
+
+```
+首次访问（localStorage 无 ep_darkMode 键）
+  │
+  ▼
+unset 状态
+  │
+  ├─ colibris + enableDarkMode=true + 系统暗
+  │    → T2 IIFE 切暗（防白闪）
+  │    → T3 再切暗（幂等）+ checkbox 显示为 checked
+  │    → 用户如果保持不动：一直是 unset
+  │    │
+  │    ├─ 用户取消勾选 checkbox
+  │    │    → ep_darkMode = "false"
+  │    │    → DOM 立刻改亮 + meta 同步改
+  │    │    → 下次刷新：T2/T3 都命中 "==='false'" 判断，保持亮
+  │    │
+  │    └─ 用户先不操作，后来系统切亮又切回暗
+  │         → 不触发重渲染，保持当前状态
+  │         → 刷新后：重新走 unset 分支
+  │
+  ├─ colibris + enableDarkMode=false
+  │    → 无 IIFE，无自动切暗，checkbox 隐藏
+  │    → ep_darkMode 永远保持 unset（除非手动 F12 改 localStorage）
+  │
+  └─ 非 colibris（无论 enableDarkMode）
+       → 无 IIFE，无 meta
+       → enableDarkMode=true 时 checkbox 显示但视觉不一致
+       → 勾选 checkbox 写入 "true"，但刷新后系统暗才生效（系统亮则白写）
+```
+
+### 11.7 给开发者/运维的 localStorage 相关注意事项
+
+1. **如果要强制所有用户亮模式**：只设 `enableDarkMode=false` 就够了。不需要去清用户的 `ep_darkMode` localStorage，因为 enableDarkMode=false 时所有 localStorage 读取代码路径都被短路，值写了也白写。
+
+2. **如果要强制所有用户暗模式**：仅靠现有代码做不到。需要改造以下两处之一：
+   - 去掉 T2 和 T3 的 `matchMedia(dark).matches` 守卫
+   - 或在服务端把 `skinVariants` 默认值改成 `super-dark-toolbar dark-background super-dark-editor`，并把 enableDarkMode=false（这样 T1 就把暗色 class 写进 `<html>`，同时不触发任何自动切换逻辑）
+
+3. **排查"我明明勾了暗色但刷新又变亮"**：检查系统 `prefers-color-scheme`。当前亮系统下，勾选暗色只在本次会话生效；刷新后 T2/T3 的 `matchMedia` 条件不满足，会回到亮。这是**按设计行为**不是 bug。
+
+4. **自定义皮肤 + enableDarkMode=true 的 UX 修复**：
+   - 如果你的皮肤有 variant CSS，记得同时扩展 `SkinColors.ts` 让 `configuredToolbarColor` / `darkToolbarColor` 返回非 null——这样 T1 才会输出 meta 和 IIFE，防白闪 + 地址栏颜色才能正常工作
+   - 如果你的皮肤没有 variant CSS，务必把 `enableDarkMode=false`，否则用户会看到"有 checkbox 但点了没用"的坏体验
+
+5. **调试 localStorage 状态**：在 DevTools Console 里执行：
+   ```javascript
+   localStorage.getItem('ep_darkMode')  // null / "true" / "false"
+   document.documentElement.className   // 看当前实际生效的 variant class
+   document.querySelectorAll('meta[name="theme-color"]')  // 看输出了几个 meta
+   ```
